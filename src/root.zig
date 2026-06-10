@@ -1274,7 +1274,7 @@ fn fmtOp(comptime op: anytype) []const u8 {
         },
         .@"struct" => {
             if (T == ParamHandle) {
-                return std.fmt.comptimePrint("%{s}", .{op.name});
+                return std.fmt.comptimePrint("{s}", .{op.name});
             }
             if (@hasDecl(T, "ty") and @hasField(T, "data")) {
                 switch (op.data) {
@@ -1321,33 +1321,16 @@ pub const KernelBuilder = struct {
     name: []const u8 = "",
     params_text: []const u8 = "",
     counts: struct {
-        pred: u32 = 0,
-        b8: u32 = 0,
-        b16: u32 = 0,
-        b32: u32 = 0,
-        b64: u32 = 0,
-        b128: u32 = 0,
-        u8: u32 = 0,
-        u16: u32 = 0,
-        u32: u32 = 0,
-        u64: u32 = 0,
-        s8: u32 = 0,
-        s16: u32 = 0,
-        s32: u32 = 0,
-        s64: u32 = 0,
-        f16: u32 = 0,
-        f32: u32 = 0,
-        f64: u32 = 0,
-        f16x2: u32 = 0,
-        bf16: u32 = 0,
-        bf16x2: u32 = 0,
-        tf32: u32 = 0,
-        e4m3: u32 = 0,
-        e5m2: u32 = 0,
-        u16x2: u32 = 0,
-        u8x4: u32 = 0,
-        s16x2: u32 = 0,
-        s8x4: u32 = 0,
+        p: u32 = 0,   // %p (.pred)
+        b: u32 = 0,   // %b (.b8)
+        h: u32 = 0,   // %h (.b16)
+        r: u32 = 0,   // %r (.b32)
+        rd: u32 = 0,  // %rd (.b64)
+        q: u32 = 0,   // %q (.b128)
+        hf: u32 = 0,  // %hf (.f16)
+        f: u32 = 0,   // %f (.f32)
+        fd: u32 = 0,  // %fd (.f64)
+        v: u32 = 0,   // %v (others)
     } = .{},
     body: []const u8 = "",
 
@@ -1387,8 +1370,20 @@ pub const KernelBuilder = struct {
     }
 
     pub fn tmp(comptime self: *KernelBuilder, comptime ty: PtxType) Reg(ty) {
-        const id = @field(self.counts, @tagName(ty.scalar));
-        @field(self.counts, @tagName(ty.scalar)) += @intFromEnum(ty.vec);
+        const field_name = switch (ty.scalar) {
+            .pred => "p",
+            .b8, .u8, .s8 => "b",
+            .b16, .u16, .s16 => "h",
+            .b32, .u32, .s32 => "r",
+            .b64, .u64, .s64 => "rd",
+            .b128 => "q",
+            .f16, .bf16 => "hf",
+            .f32, .tf32 => "f",
+            .f64 => "fd",
+            else => "v",
+        };
+        const id = @field(self.counts, field_name);
+        @field(self.counts, field_name) += @intFromEnum(ty.vec);
         return .{ .data = .{ .id = id } };
     }
 
@@ -1580,7 +1575,11 @@ pub const KernelBuilder = struct {
     pub fn mul(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         validate(.mul, ty);
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mul{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        const mod = switch (ty.scalar) {
+            .f16, .f16x2, .f32, .f64, .bf16, .bf16x2 => "",
+            else => ".lo",
+        };
+        self.line(std.fmt.comptimePrint("mul{s}{s} {s}, {s}, {s};", .{ mod, ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn mul24(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
@@ -2117,14 +2116,25 @@ pub const KernelBuilder = struct {
     }
     pub fn generate(comptime self: *KernelBuilder) []const u8 {
         var res: []const u8 = "";
-        res = res ++ ".visible .entry " ++ self.name ++ "(\n";
+        res = res ++ ".entry " ++ self.name ++ "(\n";
         if (self.params_text.len > 0) res = res ++ self.params_text ++ "\n";
         res = res ++ ") {\n";
         inline for (std.meta.fields(@TypeOf(self.counts))) |field| {
             const count = @field(self.counts, field.name);
             if (count > 0) {
-                const s_ty = @field(ScalarType, field.name);
-                res = res ++ std.fmt.comptimePrint("\t.reg {s} {s}<{d}>;\n", .{ s_ty.suffix(), s_ty.prefix(), count });
+                const p_ty: PtxType = blk: {
+                    if (std.mem.eql(u8, field.name, "p")) break :blk .pred;
+                    if (std.mem.eql(u8, field.name, "b")) break :blk .b8;
+                    if (std.mem.eql(u8, field.name, "h")) break :blk .b16;
+                    if (std.mem.eql(u8, field.name, "r")) break :blk .b32;
+                    if (std.mem.eql(u8, field.name, "rd")) break :blk .b64;
+                    if (std.mem.eql(u8, field.name, "q")) break :blk .b128;
+                    if (std.mem.eql(u8, field.name, "hf")) break :blk PtxType{ .scalar = .f16 };
+                    if (std.mem.eql(u8, field.name, "f")) break :blk PtxType{ .scalar = .f32 };
+                    if (std.mem.eql(u8, field.name, "fd")) break :blk PtxType{ .scalar = .f64 };
+                    break :blk .b32;
+                };
+                res = res ++ std.fmt.comptimePrint("\t.reg {s} {s}<{d}>;\n", .{ p_ty.suffix(), p_ty.prefix(), count });
             }
         }
         res = res ++ self.body;
@@ -2136,8 +2146,8 @@ pub const KernelBuilder = struct {
 // --- Module Orchestration ---
 
 pub const ModuleOptions = struct {
-    version: Version = .v9_3,
-    target: Target = .sm_90,
+    version: Version = .v8_4,
+    target: Target = .sm_75,
     address_size: u32 = 64,
 };
 
@@ -2154,17 +2164,17 @@ pub const Module = struct {
         return k;
     }
 
-    pub fn generate(comptime self: *Module) []const u8 {
-        var res: []const u8 = "";
+    pub fn generate(comptime self: *Module) [:0]const u8 {
+        var res: [:0]const u8 = "";
         res = res ++ std.fmt.comptimePrint(".version {d}.{d}\n", .{ self.options.version.major, self.options.version.minor });
         res = res ++ ".target " ++ @tagName(self.options.target) ++ "\n";
         res = res ++ std.fmt.comptimePrint(".address_size {d}\n\n", .{self.options.address_size});
         inline for (self.kernels[0..self.kernel_count]) |*k| res = res ++ k.generate() ++ "\n";
-        return res;
+        return res ++ "\x00";
     }
 };
 
-pub fn build(comptime opt: ModuleOptions, comptime definition: anytype) []const u8 {
+pub fn build(comptime opt: ModuleOptions, comptime definition: anytype) [:0]const u8 {
     comptime var m = Module{ .options = opt };
     const T = @TypeOf(definition);
     if (T == type) {
@@ -2172,9 +2182,13 @@ pub fn build(comptime opt: ModuleOptions, comptime definition: anytype) []const 
             definition.emit(&m);
         } else {
             inline for (std.meta.declarations(definition)) |decl| {
-                const item = @field(definition, decl.name);
+                const decl_name = comptime blk: {
+                    const DeclType = @TypeOf(decl);
+                    break :blk if (DeclType == [:0]const u8 or DeclType == []const u8) decl else decl.name;
+                };
+                const item = @field(definition, decl_name);
                 if (@typeInfo(@TypeOf(item)) == .@"fn") {
-                    const k = m.entry(decl.name, .{});
+                    const k = m.entry(decl_name, .{});
                     item(k);
                 }
             }

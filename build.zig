@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.root_module.linkSystemLibrary("cuda", .{});
+    exe.root_module.linkSystemLibrary("c", .{});
 
     b.installArtifact(exe);
     const run_step = b.step("run", "Run the app");
@@ -27,9 +29,6 @@ pub fn build(b: *std.Build) void {
 
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
