@@ -126,6 +126,9 @@ pub const PtxType = struct {
     pub const b64 = PtxType{ .scalar = .b64 };
     pub const @"u32" = PtxType{ .scalar = .u32 };
     pub const @"u64" = PtxType{ .scalar = .u64 };
+    pub const s32 = PtxType{ .scalar = .s32 };
+    pub const s64 = PtxType{ .scalar = .s64 };
+    pub const @"f16" = PtxType{ .scalar = .f16 };
     pub const @"f32" = PtxType{ .scalar = .f32 };
     pub const @"f64" = PtxType{ .scalar = .f64 };
 };
@@ -469,7 +472,13 @@ pub const ParamHandle = struct {
 
 pub fn ParamsResult(comptime T: type) type {
     const info = @typeInfo(T);
-    if (info != .@"struct" or info.@"struct".is_tuple) return void;
+    if (info != .@"struct") return void;
+    if (info.@"struct".is_tuple) {
+        const fields = info.@"struct".fields;
+        var field_types: [fields.len]type = undefined;
+        inline for (0..fields.len) |i| field_types[i] = ParamHandle;
+        return std.meta.Tuple(&field_types);
+    }
     const fields = info.@"struct".fields;
     var field_names: [fields.len][:0]const u8 = undefined;
     var field_types: [fields.len]type = undefined;
@@ -488,6 +497,11 @@ pub fn Reg(comptime ty_: PtxType) type {
         data: union(enum) {
             id: u32,
             name: []const u8,
+            imm: union(enum) {
+                u: u64,
+                s: i64,
+                f: f64,
+            },
         },
     };
 }
@@ -1293,6 +1307,13 @@ fn fmtOp(comptime op: anytype) []const u8 {
                         }
                     },
                     .name => |name| return std.fmt.comptimePrint("%{s}", .{name}),
+                    .imm => |imm| {
+                        return switch (imm) {
+                            .u => |v| std.fmt.comptimePrint("{d}", .{v}),
+                            .s => |v| std.fmt.comptimePrint("{d}", .{v}),
+                            .f => |v| std.fmt.comptimePrint("{d}", .{v}),
+                        };
+                    },
                 }
             }
             if (@hasDecl(T, "space") and @hasDecl(T, "ty") and @hasField(T, "reg")) {
@@ -1320,6 +1341,7 @@ fn validate(comptime op: Opcode, comptime ty: PtxType) void {
 pub const KernelBuilder = struct {
     name: []const u8 = "",
     params_text: []const u8 = "",
+    active_predicate: ?[]const u8 = null,
     counts: struct {
         p: u32 = 0,   // %p (.pred)
         b: u32 = 0,   // %b (.b8)
@@ -1338,11 +1360,20 @@ pub const KernelBuilder = struct {
         const T = @TypeOf(ps);
         const info = @typeInfo(T);
         if (info.@"struct".is_tuple) {
+            var res: ParamsResult(T) = undefined;
             inline for (ps, 0..) |p, i| {
+                const ty: PtxType = blk: {
+                    if (@TypeOf(p) == PtxType) break :blk p;
+                    if (@TypeOf(p) == ScalarType) break :blk PtxType{ .scalar = p };
+                    if (@typeInfo(@TypeOf(p)) == .enum_literal) break :blk PtxType{ .scalar = @field(ScalarType, @tagName(p)) };
+                    @compileError("Invalid parameter type for tuple index " ++ std.fmt.comptimePrint("{}", .{i}));
+                };
+                const name = std.fmt.comptimePrint("p{d}", .{i});
                 if (i > 0 or self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
-                self.params_text = self.params_text ++ "\t.param " ++ p;
+                self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), name });
+                res[i] = .{ .name = name, .ty = ty };
             }
-            return {};
+            return res;
         } else {
             var res: ParamsResult(T) = undefined;
             inline for (info.@"struct".fields) |field| {
@@ -1366,7 +1397,30 @@ pub const KernelBuilder = struct {
     }
 
     pub fn line(comptime self: *KernelBuilder, comptime s: []const u8) void {
-        self.raw("\t" ++ s ++ "\n");
+        if (self.active_predicate) |p| {
+            if (s[0] == '@') {
+                @compileError("Nested predicates not supported: " ++ p ++ " and " ++ s);
+            }
+            self.raw("\t" ++ p ++ " " ++ s ++ "\n");
+        } else {
+            self.raw("\t" ++ s ++ "\n");
+        }
+    }
+
+    pub fn setPredicate(comptime self: *KernelBuilder, p: anytype, is_neg: bool) void {
+        const p_str = if (is_neg) "@!" else "@";
+        self.active_predicate = p_str ++ fmtOp(p);
+    }
+
+    pub fn clearPredicate(comptime self: *KernelBuilder) void {
+        self.active_predicate = null;
+    }
+
+    pub fn predicated(comptime self: *KernelBuilder, p: anytype, is_neg: bool, comptime body_fn: anytype) void {
+        const old = self.active_predicate;
+        self.setPredicate(p, is_neg);
+        body_fn(self);
+        self.active_predicate = old;
     }
 
     pub fn tmp(comptime self: *KernelBuilder, comptime ty: PtxType) Reg(ty) {
@@ -1668,8 +1722,11 @@ pub const KernelBuilder = struct {
     pub fn shl(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         validate(.shl, ty);
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("shl.b32 {s}, {s}, {s};", .{ fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        self.line(std.fmt.comptimePrint("shl{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
+    }
+    pub fn label(comptime self: *KernelBuilder, comptime name: []const u8) void {
+        self.raw(name ++ ":\n");
     }
     pub fn shr(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         validate(.shr, ty);
@@ -1731,10 +1788,10 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("xor{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn cvt(comptime self: *KernelBuilder, comptime dst_ty: PtxType, comptime src_ty: PtxType, a: anytype) Reg(dst_ty) {
+    pub fn cvt(comptime self: *KernelBuilder, comptime dst_ty: PtxType, comptime src_ty: PtxType, a: anytype, comptime rnd: RoundingMode) Reg(dst_ty) {
         validate(.cvt, dst_ty);
         const dst = self.tmp(dst_ty);
-        self.line(std.fmt.comptimePrint("cvt{s}{s} {s}, {s};", .{ dst_ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        self.line(std.fmt.comptimePrint("cvt{s}{s}{s} {s}, {s};", .{ rnd.suffix(), dst_ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn cvta(comptime self: *KernelBuilder, comptime dir: CvtDirection, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
@@ -1758,8 +1815,8 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("ld.param{s} {s}, [{s}];", .{ p.ty.suffix(), fmtOp(dst), fmtOp(p) }));
         return dst;
     }
-    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, name: []const u8, val: anytype) void {
-        self.line(std.fmt.comptimePrint("st.global{s} [%{s}], {s};", .{ ty.suffix(), name, fmtOp(val) }));
+    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, addr: anytype, val: anytype) void {
+        self.line(std.fmt.comptimePrint("st.global{s} [{s}], {s};", .{ ty.suffix(), fmtOp(addr), fmtOp(val) }));
     }
     pub fn ret(comptime self: *KernelBuilder) void {
         self.line("ret;");
@@ -1794,8 +1851,8 @@ pub const KernelBuilder = struct {
     pub fn discard(comptime self: *KernelBuilder, addr: anytype, size: anytype) void {
         self.line(std.fmt.comptimePrint("discard.global.b64 [{s}], {s};", .{ fmtOp(addr), fmtOp(size) }));
     }
-    pub fn bra(comptime self: *KernelBuilder, comptime label: []const u8) void {
-        self.line("bra " ++ label ++ ";");
+    pub fn bra(comptime self: *KernelBuilder, comptime target: []const u8) void {
+        self.line("bra " ++ target ++ ";");
     }
     pub fn call(comptime self: *KernelBuilder, comptime name: []const u8, args: anytype) void {
         var s: []const u8 = "call " ++ name ++ ", (";
@@ -2078,14 +2135,14 @@ pub const KernelBuilder = struct {
     pub fn ldu(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype) Reg(ty) {
         validate(.ldu, ty);
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(addr_op) }));
+        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, [{s}];", .{ ty.suffix(), fmtOp(dst), fmtOp(addr_op) }));
         return dst;
     }
     pub fn prefetch(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
-        self.line(std.fmt.comptimePrint("prefetch.global{s} {s};", .{ level.suffix(), fmtOp(addr_op) }));
+        self.line(std.fmt.comptimePrint("prefetch.global{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn prefetchu(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
-        self.line(std.fmt.comptimePrint("prefetchu{s} {s};", .{ level.suffix(), fmtOp(addr_op) }));
+        self.line(std.fmt.comptimePrint("prefetchu{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
         const dst = self.tmp(PtxType.pred);
@@ -2153,13 +2210,13 @@ pub const ModuleOptions = struct {
 
 pub const Module = struct {
     options: ModuleOptions,
-    kernels: [32]KernelBuilder = undefined,
+    kernels: [256]KernelBuilder = undefined,
     kernel_count: usize = 0,
 
     pub fn entry(comptime self: *Module, comptime name: []const u8, comptime ps: anytype) *KernelBuilder {
         const k = &self.kernels[self.kernel_count];
         k.* = .{ .name = name };
-        k.params(ps);
+        _ = k.params(ps);
         self.kernel_count += 1;
         return k;
     }
@@ -2231,4 +2288,37 @@ test "typed modifiers verification" {
         }
     });
     try std.testing.expect(std.mem.indexOf(u8, result, "setp.ge.u32") != null);
+}
+
+test "label and branch verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn test_loop(k: *ptx.KernelBuilder) void {
+            const r0 = k.tmp(PtxType.u32);
+            k.label("START");
+            const p0 = k.setp(.eq, PtxType.u32, r0, 0);
+            k.predicated(p0, false, struct {
+                fn body(inner_k: *ptx.KernelBuilder) void {
+                    inner_k.bra("START");
+                }
+            }.body);
+            k.ret();
+        }
+    });
+    try std.testing.expect(std.mem.indexOf(u8, result, "START:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "bra START;") != null);
+}
+
+test "tuple params verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn test_tuple(k: *ptx.KernelBuilder) void {
+            const ps = k.params(.{ .b64, .u32 });
+            _ = k.ldParam(ps[0]);
+            _ = k.ldParam(ps[1]);
+            k.ret();
+        }
+    });
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .b64 p0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 p1") != null);
 }
