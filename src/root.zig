@@ -1807,6 +1807,7 @@ pub const KernelBuilder = struct {
     max_virtual_registers: ?u32 = null,
     param_count: usize = 0,
     param_types: [256]PtxType = undefined,
+    param_names: [256][]const u8 = undefined,
     local_param_count: u32 = 0,
     params_text: []const u8 = "",
     active_predicate: ?[]const u8 = null,
@@ -1843,6 +1844,7 @@ pub const KernelBuilder = struct {
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), name });
                 res[i] = .{ .name = name, .ty = ty };
                 self.param_types[self.param_count] = ty;
+                self.param_names[self.param_count] = name;
                 self.param_count += 1;
             }
             return res;
@@ -1860,6 +1862,7 @@ pub const KernelBuilder = struct {
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), field.name });
                 @field(res, field.name) = .{ .name = field.name, .ty = ty };
                 self.param_types[self.param_count] = ty;
+                self.param_names[self.param_count] = field.name;
                 self.param_count += 1;
             }
             return res;
@@ -1999,6 +2002,56 @@ pub const KernelBuilder = struct {
                 }
             }
         }
+    }
+
+    fn paramTypeAt(comptime self: *const KernelBuilder, comptime index: usize) PtxType {
+        if (index >= self.param_count) {
+            @compileError(std.fmt.comptimePrint(
+                "Parameter index {d} out of bounds for {s}; parameter count is {d}",
+                .{ index, self.name, self.param_count },
+            ));
+        }
+        return self.param_types[index];
+    }
+
+    fn paramNameAt(comptime self: *const KernelBuilder, comptime index: usize) []const u8 {
+        if (index >= self.param_count) {
+            @compileError(std.fmt.comptimePrint(
+                "Parameter index {d} out of bounds for {s}; parameter count is {d}",
+                .{ index, self.name, self.param_count },
+            ));
+        }
+        return self.param_names[index];
+    }
+
+    fn paramIndex(comptime self: *const KernelBuilder, comptime name: []const u8) usize {
+        inline for (0..self.param_count) |i| {
+            if (std.mem.eql(u8, self.param_names[i], name)) return i;
+        }
+        @compileError("No parameter named " ++ name ++ " in " ++ self.name);
+    }
+
+    fn paramType(comptime self: *const KernelBuilder, comptime name: []const u8) PtxType {
+        return self.param_types[self.paramIndex(name)];
+    }
+
+    pub fn argAt(comptime self: *KernelBuilder, comptime index: usize) ParamHandle {
+        return .{
+            .name = self.paramNameAt(index),
+            .ty = self.paramTypeAt(index),
+        };
+    }
+
+    pub fn arg(comptime self: *KernelBuilder, comptime name: []const u8) ParamHandle {
+        return self.argAt(self.paramIndex(name));
+    }
+
+    pub fn ldArgAt(comptime self: *KernelBuilder, comptime index: usize) Reg(self.paramTypeAt(index)) {
+        return self.ldParam(self.argAt(index));
+    }
+
+    pub fn ldArg(comptime self: *KernelBuilder, comptime name: []const u8) Reg(self.paramType(name)) {
+        return self.ldParam(self.arg(name));
     }
 
     fn marshalCallArgs(comptime self: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) []const u8 {
@@ -3824,6 +3877,96 @@ test "marshalled function return call verification" {
     try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 __param0;") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "call.uni (__param0), answer_marshalled, ();") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [__param0];") != null);
+}
+
+test "function named argument loading helper verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const inc = m.funcRet("inc_arg", PtxType.u32, .{ .x = .u32 });
+            const x = inc.ldArg("x");
+            const y = inc.add(PtxType.u32, x, 1);
+            inc.retVal(y);
+
+            const k = m.entry("use_inc_arg", .{});
+            const a = k.tmp(PtxType.u32);
+            _ = k.callRetMarshalled(PtxType.u32, inc, .{a});
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".func (.param .u32 __ret) inc_arg(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [x];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "add.u32 %r1, %r0, 1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.param.u32 [__ret], %r1;") != null);
+}
+
+test "function tuple argument loading helper verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const tuple_loader = m.func("tuple_loader", .{ .u32, .u64 });
+            _ = tuple_loader.ldArgAt(0);
+            _ = tuple_loader.ldArgAt(1);
+            tuple_loader.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 p0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u64 p1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [p0];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u64 %rd0, [p1];") != null);
+}
+
+test "entry named argument loading helper verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const k = m.entry("entry_args", .{ .A = .b64, .N = .u32 });
+            _ = k.ldArg("A");
+            _ = k.ldArg("N");
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".entry entry_args") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .b64 A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.b64 %rd0, [A];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [N];") != null);
+}
+
+test "compile-fail validation rejects missing named parameter" {
+    try expectCompileFail(
+        "missing_named_parameter",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const f = m.func("has_x", .{ .x = .u32 });
+        \\                _ = f.ldArg("y");
+        \\                f.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "No parameter named y in has_x",
+    );
+}
+
+test "compile-fail validation rejects parameter index out of bounds" {
+    try expectCompileFail(
+        "parameter_index_out_of_bounds",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const f = m.func("one_param", .{ .u32 });
+        \\                _ = f.ldArgAt(1);
+        \\                f.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Parameter index 1 out of bounds for one_param; parameter count is 1",
+    );
 }
 
 test "declared param slot helper verification" {
