@@ -496,6 +496,10 @@ pub const Version = struct {
     pub const v8_5 = Version{ .major = 8, .minor = 5 };
     pub const v9_0 = Version{ .major = 9, .minor = 0 };
     pub const v9_3 = Version{ .major = 9, .minor = 3 };
+
+    pub fn supportsAtLeast(self: Version, comptime major: u32, comptime minor: u32) bool {
+        return self.major > major or (self.major == major and self.minor >= minor);
+    }
 };
 
 pub const ParamHandle = struct {
@@ -1389,33 +1393,6 @@ fn validate(comptime op: Opcode, comptime ty: PtxType) void {
     }
 }
 
-fn validateStateSpace(comptime op: Opcode, comptime space: StateSpace, comptime ty: PtxType) void {
-    validate(op, ty);
-    switch (op) {
-        .ld => switch (space) {
-            .global, .local, .param, .shared, .const_space => {},
-            else => @compileError("Illegal PTX state space for ld: " ++ @tagName(space)),
-        },
-        .st => switch (space) {
-            .global, .local, .shared => {},
-            else => @compileError("Illegal PTX state space for st: " ++ @tagName(space)),
-        },
-        .atom, .red => switch (space) {
-            .global, .shared => {},
-            else => @compileError("Illegal PTX state space for atomic/reduction op: " ++ @tagName(space)),
-        },
-        .cvta => switch (space) {
-            .global, .local, .shared, .const_space => {},
-            else => @compileError("Illegal PTX state space for cvta: " ++ @tagName(space)),
-        },
-        .isspacep => switch (space) {
-            .global, .local, .shared, .const_space => {},
-            else => @compileError("Illegal PTX state space for isspacep: " ++ @tagName(space)),
-        },
-        else => {},
-    }
-}
-
 fn targetSupports(comptime target: Target, comptime op: Opcode) bool {
     return switch (op) {
         .cp_async => target.supportsAtLeast(8, 0),
@@ -1426,10 +1403,222 @@ fn targetSupports(comptime target: Target, comptime op: Opcode) bool {
     };
 }
 
+pub const InstructionForm = struct {
+    op: Opcode,
+    min_version: ?Version = null,
+    allowed_spaces: []const StateSpace = &.{},
+    allowed_vecs: []const VectorSize = &.{},
+    allowed_scalars: []const ScalarType = &.{},
+    allowed_copy_sizes: []const u32 = &.{},
+};
+
+pub const InstructionContext = struct {
+    op: Opcode,
+    ty: PtxType = PtxType.b32,
+    target: Target = .sm_75,
+    version: Version = .v8_4,
+    space: ?StateSpace = null,
+    atom_op: ?AtomOp = null,
+    copy_size: ?u32 = null,
+};
+
+fn containsScalar(comptime xs: []const ScalarType, comptime x: ScalarType) bool {
+    inline for (xs) |item| {
+        if (item == x) return true;
+    }
+    return false;
+}
+
+fn containsVectorSize(comptime xs: []const VectorSize, comptime x: VectorSize) bool {
+    inline for (xs) |item| {
+        if (item == x) return true;
+    }
+    return false;
+}
+
+fn containsStateSpace(comptime xs: []const StateSpace, comptime x: StateSpace) bool {
+    inline for (xs) |item| {
+        if (item == x) return true;
+    }
+    return false;
+}
+
+fn containsU32(comptime xs: []const u32, comptime x: u32) bool {
+    inline for (xs) |item| {
+        if (item == x) return true;
+    }
+    return false;
+}
+
+fn instructionForm(comptime op: Opcode) InstructionForm {
+    return switch (op) {
+        .ld => .{
+            .op = .ld,
+            .allowed_spaces = &.{ .global, .local, .param, .shared, .const_space },
+            .allowed_vecs = &.{ .s1, .v2, .v4 },
+        },
+        .ldu => .{
+            .op = .ldu,
+            .allowed_spaces = &.{.global},
+            .allowed_vecs = &.{.s1},
+        },
+        .st => .{
+            .op = .st,
+            .allowed_spaces = &.{ .global, .local, .shared },
+            .allowed_vecs = &.{ .s1, .v2, .v4 },
+        },
+        .cvta => .{
+            .op = .cvta,
+            .allowed_spaces = &.{ .global, .local, .shared, .const_space },
+            .allowed_vecs = &.{.s1},
+            .allowed_scalars = &.{ .u32, .u64 },
+        },
+        .isspacep => .{
+            .op = .isspacep,
+            .allowed_spaces = &.{ .global, .local, .shared, .const_space },
+            .allowed_vecs = &.{.s1},
+            .allowed_scalars = &.{.pred},
+        },
+        .atom, .red => .{
+            .op = op,
+            .allowed_spaces = &.{ .global, .shared },
+            .allowed_vecs = &.{.s1},
+        },
+        .prefetch, .prefetchu => .{
+            .op = op,
+            .allowed_spaces = &.{.global},
+            .allowed_vecs = &.{.s1},
+        },
+        .cp_async => .{
+            .op = .cp_async,
+            .allowed_spaces = &.{.shared},
+            .allowed_vecs = &.{.s1},
+            .allowed_copy_sizes = &.{ 4, 8, 16 },
+        },
+        .cp_async_bulk => .{
+            .op = .cp_async_bulk,
+            .allowed_spaces = &.{.shared},
+            .allowed_vecs = &.{.s1},
+        },
+        else => .{ .op = op },
+    };
+}
+
+fn isAtomicOpTypeValid(comptime instruction: Opcode, comptime op: AtomOp, comptime ty: PtxType) bool {
+    if (ty.vec != .s1) return false;
+
+    const is_red = instruction == .red;
+    return switch (op) {
+        .add => switch (ty.scalar) {
+            .u32, .u64, .s32, .s64, .f32, .f64 => true,
+            else => false,
+        },
+        .sub => switch (ty.scalar) {
+            .u32, .s32 => true,
+            else => false,
+        },
+        .inc, .dec => switch (ty.scalar) {
+            .u32 => true,
+            else => false,
+        },
+        .min, .max => switch (ty.scalar) {
+            .u32, .u64, .s32, .s64 => true,
+            else => false,
+        },
+        .@"and", .@"or", .xor => switch (ty.scalar) {
+            .b32, .b64, .u32, .u64 => true,
+            else => false,
+        },
+        .cas => !is_red and switch (ty.scalar) {
+            .b32, .b64, .u32, .u64 => true,
+            else => false,
+        },
+        .exch => !is_red and switch (ty.scalar) {
+            .b32, .b64, .u32, .u64, .s32, .s64, .f32 => true,
+            else => false,
+        },
+    };
+}
+
+fn validateInstructionForm(comptime ctx: InstructionContext) void {
+    const form = instructionForm(ctx.op);
+
+    if (ctx.op == .atom or ctx.op == .red) {
+        const atom_op = ctx.atom_op orelse @compileError("Atomic/reduction validation requires atom_op");
+        if (!isAtomicOpTypeValid(ctx.op, atom_op, ctx.ty)) {
+            @compileError("Illegal PTX atomic/reduction form: " ++ @tagName(ctx.op) ++ atom_op.suffix() ++ ctx.ty.suffix());
+        }
+    } else {
+        validate(ctx.op, ctx.ty);
+    }
+
+    if (!targetSupports(ctx.target, ctx.op)) {
+        @compileError("PTX opcode " ++ @tagName(ctx.op) ++ " is not supported by target " ++ @tagName(ctx.target));
+    }
+
+    if (form.min_version) |min_version| {
+        if (!ctx.version.supportsAtLeast(min_version.major, min_version.minor)) {
+            @compileError(std.fmt.comptimePrint(
+                "PTX opcode {s} requires PTX version {d}.{d} or newer",
+                .{ @tagName(ctx.op), min_version.major, min_version.minor },
+            ));
+        }
+    }
+
+    if (form.allowed_spaces.len > 0) {
+        const space = ctx.space orelse @compileError("PTX opcode " ++ @tagName(ctx.op) ++ " requires a state space");
+        if (!containsStateSpace(form.allowed_spaces, space)) {
+            @compileError("Illegal PTX state space for " ++ @tagName(ctx.op) ++ ": " ++ @tagName(space));
+        }
+    }
+
+    if (form.allowed_vecs.len > 0 and !containsVectorSize(form.allowed_vecs, ctx.ty.vec)) {
+        @compileError("Illegal vector size for PTX opcode " ++ @tagName(ctx.op) ++ ctx.ty.suffix());
+    }
+
+    if (form.allowed_scalars.len > 0 and !containsScalar(form.allowed_scalars, ctx.ty.scalar)) {
+        @compileError("Illegal scalar type for PTX opcode " ++ @tagName(ctx.op) ++ ctx.ty.suffix());
+    }
+
+    if (form.allowed_copy_sizes.len > 0) {
+        if (ctx.copy_size) |copy_size| {
+            if (!containsU32(form.allowed_copy_sizes, copy_size)) {
+                @compileError(std.fmt.comptimePrint("Illegal copy size for {s}: {d}", .{ @tagName(ctx.op), copy_size }));
+            }
+        }
+    }
+}
+
+fn validateOperandStateSpace(comptime operand: anytype, comptime expected: StateSpace, comptime role: []const u8) void {
+    const T = @TypeOf(operand);
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            if (@hasDecl(T, "space") and T.space != expected) {
+                @compileError(role ++ " must be in " ++ @tagName(expected) ++ " state space, got " ++ @tagName(T.space));
+            }
+        },
+        else => {},
+    }
+}
+
+fn comptimeImmediateU32(comptime value: anytype) ?u32 {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .comptime_int => if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, value) else null,
+        .int => |info| blk: {
+            if (info.signedness == .signed and value < 0) break :blk null;
+            if (value > std.math.maxInt(u32)) break :blk null;
+            break :blk @as(u32, @intCast(value));
+        },
+        else => null,
+    };
+}
+
 // --- Kernel Builder ---
 
 pub const KernelBuilder = struct {
     name: []const u8 = "",
+    version: Version = .v8_4,
     target: Target = .sm_75,
     max_virtual_registers: ?u32 = null,
     params_text: []const u8 = "",
@@ -1514,6 +1703,18 @@ pub const KernelBuilder = struct {
         self.setPredicate(p, is_neg);
         body_fn(self);
         self.active_predicate = old;
+    }
+
+    fn validateForm(comptime self: *KernelBuilder, comptime ctx: InstructionContext) void {
+        validateInstructionForm(.{
+            .op = ctx.op,
+            .ty = ctx.ty,
+            .target = self.target,
+            .version = self.version,
+            .space = ctx.space,
+            .atom_op = ctx.atom_op,
+            .copy_size = ctx.copy_size,
+        });
     }
 
     fn validateTarget(comptime self: *KernelBuilder, comptime op: Opcode) void {
@@ -1929,27 +2130,29 @@ pub const KernelBuilder = struct {
         return dst;
     }
     pub fn cvta(comptime self: *KernelBuilder, comptime dir: CvtDirection, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validateStateSpace(.cvta, space, ty);
+        self.validateForm(.{ .op = .cvta, .space = space, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("cvta{s}{s}{s} {s}, {s};", .{ dir.suffix(), space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn ld(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validateStateSpace(.ld, space, ty);
+        self.validateForm(.{ .op = .ld, .space = space, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("ld{s}{s} {s}, [{s}];", .{ space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn st(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
-        validateStateSpace(.st, space, ty);
+        self.validateForm(.{ .op = .st, .space = space, .ty = ty });
         self.line(std.fmt.comptimePrint("st{s}{s} [{s}], {s};", .{ space.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
     }
     pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
+        self.validateForm(.{ .op = .ld, .space = .param, .ty = p.ty });
         const dst = self.tmp(p.ty);
         self.line(std.fmt.comptimePrint("ld.param{s} {s}, [{s}];", .{ p.ty.suffix(), fmtOp(dst), fmtOp(p) }));
         return dst;
     }
     pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, addr: anytype, val: anytype) void {
+        self.validateForm(.{ .op = .st, .space = .global, .ty = ty });
         self.line(std.fmt.comptimePrint("st.global{s} [{s}], {s};", .{ ty.suffix(), fmtOp(addr), fmtOp(val) }));
     }
     pub fn ret(comptime self: *KernelBuilder) void {
@@ -1981,8 +2184,10 @@ pub const KernelBuilder = struct {
     pub fn membar(comptime self: *KernelBuilder, comptime level: Scope) void {
         self.line(std.fmt.comptimePrint("membar{s};", .{level.suffix()}));
     }
-    pub fn cp_async(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype) void {
-        self.validateTarget(.cp_async);
+    pub fn cp_async(comptime self: *KernelBuilder, dst: anytype, src: anytype, comptime size: anytype) void {
+        validateOperandStateSpace(dst, .shared, "cp.async destination");
+        validateOperandStateSpace(src, .global, "cp.async source");
+        self.validateForm(.{ .op = .cp_async, .space = .shared, .copy_size = comptimeImmediateU32(size) });
         self.line(std.fmt.comptimePrint("cp.async.ca.shared.global [{s}], [{s}], {s};", .{ fmtOp(dst), fmtOp(src), fmtOp(size) }));
     }
     pub fn discard(comptime self: *KernelBuilder, addr: anytype, size: anytype) void {
@@ -2000,13 +2205,13 @@ pub const KernelBuilder = struct {
         self.line(s ++ ");");
     }
     pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validateStateSpace(.atom, space, ty);
+        self.validateForm(.{ .op = .atom, .space = space, .ty = ty, .atom_op = op });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("atom{s}{s}{s} {s}, [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn red(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
-        validateStateSpace(.red, space, ty);
+        self.validateForm(.{ .op = .red, .space = space, .ty = ty, .atom_op = op });
         self.line(std.fmt.comptimePrint("red{s}{s}{s} [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
     }
     pub fn vote(comptime self: *KernelBuilder, comptime mode: VoteMode, a: anytype) Reg(PtxType.b32) {
@@ -2255,37 +2460,37 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 [{s}], {s};", .{ op.suffix(), fmtOp(addr_op), fmtOp(size) }));
     }
     pub fn mma(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
-        self.validateTarget(.mma);
-        validate(.mma, d_ty);
+        self.validateForm(.{ .op = .mma, .ty = d_ty });
         const dst = self.tmp(d_ty);
         self.line(std.fmt.comptimePrint("mma.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
     pub fn wgmma_mma_async(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
-        self.validateTarget(.wgmma_mma_async);
-        validate(.wgmma_mma_async, d_ty);
+        self.validateForm(.{ .op = .wgmma_mma_async, .ty = d_ty });
         const dst = self.tmp(d_ty);
         self.line(std.fmt.comptimePrint("wgmma.mma_async.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
     pub fn pmevent(comptime self: *KernelBuilder, a: anytype) void {
-        validate(.pmevent, ScalarType.u32);
+        validate(.pmevent, PtxType.u32);
         self.line(std.fmt.comptimePrint("pmevent {s};", .{fmtOp(a)}));
     }
     pub fn ldu(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype) Reg(ty) {
-        validate(.ldu, ty);
+        self.validateForm(.{ .op = .ldu, .space = .global, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("ldu.global{s} {s}, [{s}];", .{ ty.suffix(), fmtOp(dst), fmtOp(addr_op) }));
         return dst;
     }
     pub fn prefetch(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
+        self.validateForm(.{ .op = .prefetch, .space = .global, .ty = PtxType.b8 });
         self.line(std.fmt.comptimePrint("prefetch.global{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn prefetchu(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
+        self.validateForm(.{ .op = .prefetchu, .space = .global, .ty = PtxType.b8 });
         self.line(std.fmt.comptimePrint("prefetchu{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
-        validateStateSpace(.isspacep, space, PtxType.pred);
+        self.validateForm(.{ .op = .isspacep, .space = space, .ty = PtxType.pred });
         const dst = self.tmp(PtxType.pred);
         self.line(std.fmt.comptimePrint("isspacep{s} {s}, {s};", .{ space.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
@@ -2296,7 +2501,9 @@ pub const KernelBuilder = struct {
         return dst;
     }
     pub fn cp_async_bulk(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype, flag: anytype) void {
-        self.validateTarget(.cp_async_bulk);
+        validateOperandStateSpace(dst, .shared, "cp.async.bulk destination");
+        validateOperandStateSpace(src, .global, "cp.async.bulk source");
+        self.validateForm(.{ .op = .cp_async_bulk, .space = .shared, .ty = PtxType.b8 });
         self.line(std.fmt.comptimePrint("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag [{s}], [{s}], {s}, [{s}];", .{ fmtOp(dst), fmtOp(src), fmtOp(size), fmtOp(flag) }));
     }
     pub fn mbarrier(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype) void {
@@ -2362,6 +2569,7 @@ pub const Module = struct {
         const k = &self.kernels[self.kernel_count];
         k.* = .{
             .name = name,
+            .version = self.options.version,
             .target = self.options.target,
             .max_virtual_registers = self.options.max_virtual_registers_per_kernel,
         };
@@ -2531,4 +2739,53 @@ test "shared handle offset formatting verification" {
     });
 
     try std.testing.expect(std.mem.indexOf(u8, result, "st.shared.b32 [scratch+4]") != null);
+}
+
+test "instruction form validation allows vector memory forms" {
+    const ptx = @This();
+    const vec4_b32 = PtxType{ .scalar = .b32, .vec = .v4 };
+    const result = comptime ptx.build(.{}, struct {
+        pub fn vec_shared(k: *ptx.KernelBuilder) void {
+            const scratch = k.allocShared(PtxType.b32, "scratch4", 16, 16);
+            const r0 = k.tmp(vec4_b32);
+            k.st(.shared, vec4_b32, scratch, r0);
+            _ = k.ld(.shared, vec4_b32, scratch);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.shared.v4.b32 [scratch4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.shared.v4.b32") != null);
+}
+
+test "instruction form validation allows atomic add forms" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn atom_add(k: *ptx.KernelBuilder) void {
+            const addr = k.tmp(PtxType.b64);
+            const val = k.tmp(PtxType.u32);
+            _ = k.atom(.add, .global, PtxType.u32, addr, val);
+            k.red(.add, .global, PtxType.u32, addr, val);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "atom.global.add.u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "red.global.add.u32") != null);
+}
+
+test "instruction form validation carries ptx version into kernels" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{ .version = .v9_0, .target = .sm_90 }, struct {
+        pub fn versioned(k: *ptx.KernelBuilder) void {
+            const scratch = k.allocShared(PtxType.b8, "bulk_dst", 16, 16);
+            const src = k.tmp(PtxType.b64);
+            const flag = k.tmp(PtxType.b64);
+            k.cp_async_bulk(scratch, src, 16, flag);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".version 9.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cp.async.bulk.shared::cluster.global") != null);
 }
