@@ -502,9 +502,30 @@ pub const Version = struct {
     }
 };
 
+pub const EntryVisibility = enum {
+    none,
+    visible,
+    @"extern",
+    weak,
+
+    pub fn prefix(self: EntryVisibility) []const u8 {
+        return switch (self) {
+            .none => "",
+            .visible => ".visible ",
+            .@"extern" => ".extern ",
+            .weak => ".weak ",
+        };
+    }
+};
+
 pub const ParamHandle = struct {
     name: []const u8,
     ty: PtxType,
+};
+
+pub const CallableKind = enum {
+    entry,
+    func,
 };
 
 pub fn ParamsResult(comptime T: type) type {
@@ -1424,6 +1445,28 @@ fn fmtAddr(comptime op: anytype) []const u8 {
     return "[" ++ fmtOp(op) ++ "]";
 }
 
+fn fmtOperandList(comptime args: anytype) []const u8 {
+    const info = @typeInfo(@TypeOf(args));
+    if (info != .@"struct") {
+        @compileError("Operand list must be a tuple or struct");
+    }
+
+    var res: []const u8 = "";
+    inline for (info.@"struct".fields, 0..) |field, i| {
+        if (i > 0) res = res ++ ", ";
+        res = res ++ fmtOp(@field(args, field.name));
+    }
+    return res;
+}
+
+fn operandCount(comptime args: anytype) usize {
+    const info = @typeInfo(@TypeOf(args));
+    if (info != .@"struct") {
+        @compileError("Operand list must be a tuple or struct");
+    }
+    return info.@"struct".fields.len;
+}
+
 fn validate(comptime op: Opcode, comptime ty: PtxType) void {
     if (!isValid(op, ty.scalar)) {
         @compileError("Illegal PTX instruction form: " ++ @tagName(op) ++ ty.suffix());
@@ -1706,13 +1749,39 @@ fn memoryDeclarationLine(comptime space: StateSpace, comptime ty: PtxType, compt
     return std.fmt.comptimePrint("\t{s} .align {d} {s} {s}[{d}];\n", .{ space.suffix(), alignment, ty.suffix(), name, len });
 }
 
+fn validatePositiveU32(comptime label: []const u8, comptime value: u32) void {
+    if (value == 0) {
+        @compileError(label ++ " must be greater than zero");
+    }
+}
+
+fn validateEntryDim3(comptime label: []const u8, comptime x: u32, comptime y: u32, comptime z: u32) void {
+    if (x == 0 or y == 0 or z == 0) {
+        @compileError(label ++ " dimensions must be greater than zero");
+    }
+}
+
+fn entryDim3Directive(comptime name: []const u8, comptime x: u32, comptime y: u32, comptime z: u32) []const u8 {
+    return std.fmt.comptimePrint("{s} {d}, {d}, {d}\n", .{ name, x, y, z });
+}
+
+fn entryU32Directive(comptime name: []const u8, comptime value: u32) []const u8 {
+    return std.fmt.comptimePrint("{s} {d}\n", .{ name, value });
+}
+
 // --- Kernel Builder ---
 
 pub const KernelBuilder = struct {
     name: []const u8 = "",
+    kind: CallableKind = .entry,
+    return_ty: ?PtxType = null,
+    return_param_name: []const u8 = "__ret",
+    entry_visibility: EntryVisibility = .none,
+    entry_directives: []const u8 = "",
     version: Version = .v8_4,
     target: Target = .sm_75,
     max_virtual_registers: ?u32 = null,
+    param_count: usize = 0,
     params_text: []const u8 = "",
     active_predicate: ?[]const u8 = null,
     counts: struct {
@@ -1746,6 +1815,7 @@ pub const KernelBuilder = struct {
                 if (i > 0 or self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), name });
                 res[i] = .{ .name = name, .ty = ty };
+                self.param_count += 1;
             }
             return res;
         } else {
@@ -1761,6 +1831,7 @@ pub const KernelBuilder = struct {
                 if (self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), field.name });
                 @field(res, field.name) = .{ .name = field.name, .ty = ty };
+                self.param_count += 1;
             }
             return res;
         }
@@ -1797,6 +1868,39 @@ pub const KernelBuilder = struct {
         self.active_predicate = old;
     }
 
+    pub fn setVisibility(comptime self: *KernelBuilder, comptime visibility: EntryVisibility) void {
+        self.entry_visibility = visibility;
+    }
+
+    fn addEntryDirective(comptime self: *KernelBuilder, comptime directive: []const u8) void {
+        self.entry_directives = self.entry_directives ++ directive;
+    }
+
+    pub fn maxntid(comptime self: *KernelBuilder, comptime x: u32, comptime y: u32, comptime z: u32) void {
+        validateEntryDim3("maxntid", x, y, z);
+        self.addEntryDirective(entryDim3Directive(".maxntid", x, y, z));
+    }
+
+    pub fn reqntid(comptime self: *KernelBuilder, comptime x: u32, comptime y: u32, comptime z: u32) void {
+        validateEntryDim3("reqntid", x, y, z);
+        self.addEntryDirective(entryDim3Directive(".reqntid", x, y, z));
+    }
+
+    pub fn minnctapersm(comptime self: *KernelBuilder, comptime value: u32) void {
+        validatePositiveU32("minnctapersm", value);
+        self.addEntryDirective(entryU32Directive(".minnctapersm", value));
+    }
+
+    pub fn maxnctapersm(comptime self: *KernelBuilder, comptime value: u32) void {
+        validatePositiveU32("maxnctapersm", value);
+        self.addEntryDirective(entryU32Directive(".maxnctapersm", value));
+    }
+
+    pub fn maxclusterrank(comptime self: *KernelBuilder, comptime value: u32) void {
+        validatePositiveU32("maxclusterrank", value);
+        self.addEntryDirective(entryU32Directive(".maxclusterrank", value));
+    }
+
     fn validateForm(comptime self: *KernelBuilder, comptime ctx: InstructionContext) void {
         validateInstructionForm(.{
             .op = ctx.op,
@@ -1829,6 +1933,22 @@ pub const KernelBuilder = struct {
             if (used > limit) {
                 @compileError(std.fmt.comptimePrint("Kernel {s} uses {d} virtual registers, exceeding configured limit {d}", .{ self.name, used, limit }));
             }
+        }
+    }
+
+    fn validateCallTarget(comptime _: *KernelBuilder, comptime callee: *const KernelBuilder) void {
+        if (callee.kind != .func) {
+            @compileError("Call target " ++ callee.name ++ " is not a .func");
+        }
+    }
+
+    fn validateCallArgCount(comptime _: *KernelBuilder, comptime callee: *const KernelBuilder, comptime args: anytype) void {
+        const actual = operandCount(args);
+        if (actual != callee.param_count) {
+            @compileError(std.fmt.comptimePrint(
+                "Call to {s} expects {d} arguments, got {d}",
+                .{ callee.name, callee.param_count, actual },
+            ));
         }
     }
 
@@ -2287,13 +2407,52 @@ pub const KernelBuilder = struct {
     pub fn bra(comptime self: *KernelBuilder, comptime target: []const u8) void {
         self.line("bra " ++ target ++ ";");
     }
+
     pub fn call(comptime self: *KernelBuilder, comptime name: []const u8, args: anytype) void {
-        var s: []const u8 = "call " ++ name ++ ", (";
-        inline for (args, 0..) |arg, i| {
-            if (i > 0) s = s ++ ", ";
-            s = s ++ fmtOp(arg);
+        self.line("call " ++ name ++ ", (" ++ fmtOperandList(args) ++ ");");
+    }
+
+    pub fn callVoid(comptime self: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) void {
+        self.validateCallTarget(callee);
+        self.validateCallArgCount(callee, args);
+        if (callee.return_ty != null) {
+            @compileError("Function " ++ callee.name ++ " returns a value; use callRet");
         }
-        self.line(s ++ ");");
+        self.line("call.uni " ++ callee.name ++ ", (" ++ fmtOperandList(args) ++ ");");
+    }
+
+    pub fn callRet(comptime self: *KernelBuilder, comptime ret_ty: PtxType, comptime callee: *const KernelBuilder, args: anytype) Reg(ret_ty) {
+        self.validateCallTarget(callee);
+        self.validateCallArgCount(callee, args);
+        const callee_ret_ty = callee.return_ty orelse @compileError("Function " ++ callee.name ++ " does not return a value");
+        if (scalarByteSize(ret_ty.scalar) != scalarByteSize(callee_ret_ty.scalar)) {
+            @compileError(
+                "Call return width mismatch for " ++
+                    callee.name ++
+                    ": expected " ++
+                    ret_ty.suffix() ++
+                    ", got " ++
+                    callee_ret_ty.suffix(),
+            );
+        }
+
+        const dst = self.tmp(ret_ty);
+        self.line("call.uni (" ++ fmtOp(dst) ++ "), " ++ callee.name ++ ", (" ++ fmtOperandList(args) ++ ");");
+        return dst;
+    }
+
+    pub fn returnParam(comptime self: *KernelBuilder) ParamHandle {
+        const ty = self.return_ty orelse @compileError("Function " ++ self.name ++ " does not return a value");
+        return .{ .name = self.return_param_name, .ty = ty };
+    }
+
+    pub fn stParam(comptime self: *KernelBuilder, comptime p: ParamHandle, val: anytype) void {
+        self.line("st.param" ++ p.ty.suffix() ++ " " ++ fmtAddr(p) ++ ", " ++ fmtOp(val) ++ ";");
+    }
+
+    pub fn retVal(comptime self: *KernelBuilder, val: anytype) void {
+        self.stParam(self.returnParam(), val);
+        self.ret();
     }
     pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         self.validateForm(.{ .op = .atom, .space = space, .ty = ty, .atom_op = op });
@@ -2622,9 +2781,20 @@ pub const KernelBuilder = struct {
     }
     pub fn generate(comptime self: *KernelBuilder) []const u8 {
         var res: []const u8 = "";
-        res = res ++ ".entry " ++ self.name ++ "(\n";
+        switch (self.kind) {
+            .entry => res = res ++ self.entry_visibility.prefix() ++ ".entry " ++ self.name ++ "(\n",
+            .func => {
+                res = res ++ ".func ";
+                if (self.return_ty) |ty| {
+                    res = res ++ "(.param " ++ ty.suffix() ++ " " ++ self.return_param_name ++ ") ";
+                }
+                res = res ++ self.name ++ "(\n";
+            },
+        }
         if (self.params_text.len > 0) res = res ++ self.params_text ++ "\n";
-        res = res ++ ") {\n";
+        res = res ++ ")\n";
+        if (self.entry_directives.len > 0) res = res ++ self.entry_directives;
+        res = res ++ "{\n";
         if (self.shared_decls.len > 0) res = res ++ self.shared_decls;
         inline for (std.meta.fields(@TypeOf(self.counts))) |field| {
             const count = @field(self.counts, field.name);
@@ -2657,11 +2827,14 @@ pub const ModuleOptions = struct {
     target: Target = .sm_75,
     address_size: u32 = 64,
     max_virtual_registers_per_kernel: ?u32 = null,
+    entry_visibility: EntryVisibility = .none,
 };
 
 pub const Module = struct {
     options: ModuleOptions,
     kernels: [256]KernelBuilder = undefined,
+    functions: [256]KernelBuilder = undefined,
+    function_count: usize = 0,
     const_decls: []const u8 = "",
     global_decls: []const u8 = "",
     kernel_count: usize = 0,
@@ -2690,10 +2863,44 @@ pub const Module = struct {
         return .{ .name = name };
     }
 
+    fn createFunc(
+        comptime self: *Module,
+        comptime name: []const u8,
+        comptime return_ty: ?PtxType,
+        comptime ps: anytype,
+    ) *KernelBuilder {
+        const f = &self.functions[self.function_count];
+        f.* = .{
+            .name = name,
+            .kind = .func,
+            .return_ty = return_ty,
+            .version = self.options.version,
+            .target = self.options.target,
+            .max_virtual_registers = self.options.max_virtual_registers_per_kernel,
+        };
+        _ = f.params(ps);
+        self.function_count += 1;
+        return f;
+    }
+
+    pub fn func(comptime self: *Module, comptime name: []const u8, comptime ps: anytype) *KernelBuilder {
+        return self.createFunc(name, null, ps);
+    }
+
+    pub fn funcRet(
+        comptime self: *Module,
+        comptime name: []const u8,
+        comptime return_ty: PtxType,
+        comptime ps: anytype,
+    ) *KernelBuilder {
+        return self.createFunc(name, return_ty, ps);
+    }
+
     pub fn entry(comptime self: *Module, comptime name: []const u8, comptime ps: anytype) *KernelBuilder {
         const k = &self.kernels[self.kernel_count];
         k.* = .{
             .name = name,
+            .entry_visibility = self.options.entry_visibility,
             .version = self.options.version,
             .target = self.options.target,
             .max_virtual_registers = self.options.max_virtual_registers_per_kernel,
@@ -2713,6 +2920,7 @@ pub const Module = struct {
         if (self.const_decls.len > 0 or self.global_decls.len > 0) {
             res = res ++ "\n";
         }
+        inline for (self.functions[0..self.function_count]) |*f| res = res ++ f.generate() ++ "\n";
         inline for (self.kernels[0..self.kernel_count]) |*k| res = res ++ k.generate() ++ "\n";
         return res ++ "\x00";
     }
@@ -3238,5 +3446,242 @@ test "compile-fail validation rejects invalid red cas form" {
         \\
         ,
         "Illegal PTX atomic/reduction form: red.cas.u32",
+    );
+}
+
+test "entry launch directives verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn launch_bounds(k: *ptx.KernelBuilder) void {
+            k.maxntid(256, 1, 1);
+            k.reqntid(128, 2, 1);
+            k.minnctapersm(2);
+            k.maxnctapersm(4);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".maxntid 256, 1, 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".reqntid 128, 2, 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".minnctapersm 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".maxnctapersm 4") != null);
+
+    const entry_pos = std.mem.indexOf(u8, result, ".entry launch_bounds").?;
+    const directive_pos = std.mem.indexOf(u8, result, ".maxntid 256, 1, 1").?;
+    const body_pos = std.mem.indexOf(u8, result, "ret;").?;
+    try std.testing.expect(entry_pos < directive_pos);
+    try std.testing.expect(directive_pos < body_pos);
+}
+
+test "entry visibility option verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{ .entry_visibility = .visible }, struct {
+        pub fn visible_kernel(k: *ptx.KernelBuilder) void {
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".visible .entry visible_kernel") != null);
+}
+
+test "per-kernel entry visibility override verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn exported(k: *ptx.KernelBuilder) void {
+            k.setVisibility(.visible);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".visible .entry exported") != null);
+}
+
+test "cluster launch directive verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{ .target = .sm_90 }, struct {
+        pub fn clustered(k: *ptx.KernelBuilder) void {
+            k.maxclusterrank(8);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".maxclusterrank 8") != null);
+}
+
+test "compile-fail validation rejects invalid maxntid dimensions" {
+    try expectCompileFail(
+        "invalid_maxntid_dimensions",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                k.maxntid(0, 1, 1);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "maxntid dimensions must be greater than zero",
+    );
+}
+
+test "compile-fail validation rejects invalid reqntid dimensions" {
+    try expectCompileFail(
+        "invalid_reqntid_dimensions",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                k.reqntid(128, 0, 1);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "reqntid dimensions must be greater than zero",
+    );
+}
+
+test "compile-fail validation rejects invalid cta occupancy directive" {
+    try expectCompileFail(
+        "invalid_minnctapersm",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                k.minnctapersm(0);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "minnctapersm must be greater than zero",
+    );
+}
+
+test "void function emission and call verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const helper = m.func("helper", .{});
+            helper.ret();
+
+            const k = m.entry("caller", .{});
+            k.callVoid(helper, .{});
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".func helper(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call.uni helper, ();") != null);
+
+    const func_pos = std.mem.indexOf(u8, result, ".func helper(").?;
+    const entry_pos = std.mem.indexOf(u8, result, ".entry caller").?;
+    try std.testing.expect(func_pos < entry_pos);
+}
+
+test "function return value call verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const answer = m.funcRet("answer", PtxType.u32, .{});
+            answer.retVal(42);
+
+            const k = m.entry("use_answer", .{});
+            const r0 = k.callRet(PtxType.u32, answer, .{});
+            k.stGlobal(PtxType.u32, "out", r0);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".func (.param .u32 __ret) answer(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.param.u32 [__ret], 42;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call.uni (%r0), answer, ();") != null);
+}
+
+test "function parameter call verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const sink = m.func("sink", .{ .x = .u32, .y = .u32 });
+            sink.ret();
+
+            const k = m.entry("call_sink", .{});
+            const x = k.tmp(PtxType.u32);
+            const y = k.tmp(PtxType.u32);
+            k.callVoid(sink, .{ x, y });
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call.uni sink, (%r0, %r1);") != null);
+}
+
+test "compile-fail validation rejects void call to returning function" {
+    try expectCompileFail(
+        "void_call_to_returning_function",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const answer = m.funcRet("answer", ptx.PtxType.u32, .{});
+        \\                answer.retVal(1);
+        \\                const k = m.entry("invalid", .{});
+        \\                k.callVoid(answer, .{});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Function answer returns a value; use callRet",
+    );
+}
+
+test "compile-fail validation rejects return call to void function" {
+    try expectCompileFail(
+        "return_call_to_void_function",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const helper = m.func("helper", .{});
+        \\                helper.ret();
+        \\                const k = m.entry("invalid", .{});
+        \\                _ = k.callRet(ptx.PtxType.u32, helper, .{});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Function helper does not return a value",
+    );
+}
+
+test "compile-fail validation rejects function argument count mismatch" {
+    try expectCompileFail(
+        "function_argument_count_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const sink = m.func("sink", .{ .x = .u32, .y = .u32 });
+        \\                sink.ret();
+        \\                const k = m.entry("invalid", .{});
+        \\                const x = k.tmp(ptx.PtxType.u32);
+        \\                k.callVoid(sink, .{x});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Call to sink expects 2 arguments, got 1",
+    );
+}
+
+test "compile-fail validation rejects return width mismatch" {
+    try expectCompileFail(
+        "function_return_width_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const answer = m.funcRet("answer", ptx.PtxType.u64, .{});
+        \\                answer.retVal(1);
+        \\                const k = m.entry("invalid", .{});
+        \\                _ = k.callRet(ptx.PtxType.u32, answer, .{});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Call return width mismatch for answer: expected .u32, got .u64",
     );
 }
