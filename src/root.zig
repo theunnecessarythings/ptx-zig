@@ -1398,14 +1398,30 @@ fn fmtOp(comptime op: anytype) []const u8 {
                 const r_str = fmtOp(op.reg);
                 if (op.offset == 0) {
                     return std.fmt.comptimePrint("[{s}]", .{r_str});
-                } else {
+                } else if (op.offset > 0) {
                     return std.fmt.comptimePrint("[{s}+{d}]", .{ r_str, op.offset });
+                } else {
+                    return std.fmt.comptimePrint("[{s}{d}]", .{ r_str, op.offset });
                 }
             }
         },
         else => {},
     }
     return std.fmt.comptimePrint("{}", .{op});
+}
+
+fn fmtAddr(comptime op: anytype) []const u8 {
+    const T = @TypeOf(op);
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            if (@hasDecl(T, "space") and @hasDecl(T, "ty") and @hasField(T, "reg")) {
+                return fmtOp(op);
+            }
+        },
+        else => {},
+    }
+
+    return "[" ++ fmtOp(op) ++ "]";
 }
 
 fn validate(comptime op: Opcode, comptime ty: PtxType) void {
@@ -1618,6 +1634,43 @@ fn validateOperandStateSpace(comptime operand: anytype, comptime expected: State
         .@"struct" => {
             if (@hasDecl(T, "space") and T.space != expected) {
                 @compileError(role ++ " must be in " ++ @tagName(expected) ++ " state space, got " ++ @tagName(T.space));
+            }
+        },
+        else => {},
+    }
+}
+
+fn scalarByteSize(comptime scalar: ScalarType) u32 {
+    return switch (scalar) {
+        .pred => 1,
+        .b8, .u8, .s8, .e4m3, .e5m2 => 1,
+        .b16, .u16, .s16, .f16, .bf16 => 2,
+        .b32, .u32, .s32, .f32, .tf32, .f16x2, .bf16x2, .u16x2, .u8x4, .s16x2, .s8x4 => 4,
+        .b64, .u64, .s64, .f64 => 8,
+        .b128 => 16,
+    };
+}
+
+fn validateMemoryAddressOperand(
+    comptime operand: anytype,
+    comptime expected: StateSpace,
+    comptime ty: PtxType,
+    comptime role: []const u8,
+) void {
+    validateOperandStateSpace(operand, expected, role);
+
+    const T = @TypeOf(operand);
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            if (@hasDecl(T, "space") and @hasDecl(T, "ty")) {
+                if (scalarByteSize(T.ty.scalar) != scalarByteSize(ty.scalar)) {
+                    @compileError(
+                        role ++ " element width mismatch: expected " ++
+                            ty.suffix() ++
+                            ", got " ++
+                            T.ty.suffix(),
+                    );
+                }
             }
         },
         else => {},
@@ -2171,23 +2224,26 @@ pub const KernelBuilder = struct {
     }
     pub fn ld(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
         self.validateForm(.{ .op = .ld, .space = space, .ty = ty });
+        validateMemoryAddressOperand(a, space, ty, "ld address");
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("ld{s}{s} {s}, [{s}];", .{ space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        self.line(std.fmt.comptimePrint("ld{s}{s} {s}, {s};", .{ space.suffix(), ty.suffix(), fmtOp(dst), fmtAddr(a) }));
         return dst;
     }
     pub fn st(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
         self.validateForm(.{ .op = .st, .space = space, .ty = ty });
-        self.line(std.fmt.comptimePrint("st{s}{s} [{s}], {s};", .{ space.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
+        validateMemoryAddressOperand(a, space, ty, "st address");
+        self.line(std.fmt.comptimePrint("st{s}{s} {s}, {s};", .{ space.suffix(), ty.suffix(), fmtAddr(a), fmtOp(b) }));
     }
     pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
         self.validateForm(.{ .op = .ld, .space = .param, .ty = p.ty });
         const dst = self.tmp(p.ty);
-        self.line(std.fmt.comptimePrint("ld.param{s} {s}, [{s}];", .{ p.ty.suffix(), fmtOp(dst), fmtOp(p) }));
+        self.line(std.fmt.comptimePrint("ld.param{s} {s}, {s};", .{ p.ty.suffix(), fmtOp(dst), fmtAddr(p) }));
         return dst;
     }
     pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, addr: anytype, val: anytype) void {
         self.validateForm(.{ .op = .st, .space = .global, .ty = ty });
-        self.line(std.fmt.comptimePrint("st.global{s} [{s}], {s};", .{ ty.suffix(), fmtOp(addr), fmtOp(val) }));
+        validateMemoryAddressOperand(addr, .global, ty, "st.global address");
+        self.line(std.fmt.comptimePrint("st.global{s} {s}, {s};", .{ ty.suffix(), fmtAddr(addr), fmtOp(val) }));
     }
     pub fn ret(comptime self: *KernelBuilder) void {
         self.line("ret;");
@@ -2222,10 +2278,11 @@ pub const KernelBuilder = struct {
         validateOperandStateSpace(dst, .shared, "cp.async destination");
         validateOperandStateSpace(src, .global, "cp.async source");
         self.validateForm(.{ .op = .cp_async, .space = .shared, .copy_size = comptimeImmediateU32(size) });
-        self.line(std.fmt.comptimePrint("cp.async.ca.shared.global [{s}], [{s}], {s};", .{ fmtOp(dst), fmtOp(src), fmtOp(size) }));
+        self.line(std.fmt.comptimePrint("cp.async.ca.shared.global {s}, {s}, {s};", .{ fmtAddr(dst), fmtAddr(src), fmtOp(size) }));
     }
     pub fn discard(comptime self: *KernelBuilder, addr: anytype, size: anytype) void {
-        self.line(std.fmt.comptimePrint("discard.global.b64 [{s}], {s};", .{ fmtOp(addr), fmtOp(size) }));
+        validateOperandStateSpace(addr, .global, "discard address");
+        self.line(std.fmt.comptimePrint("discard.global.b64 {s}, {s};", .{ fmtAddr(addr), fmtOp(size) }));
     }
     pub fn bra(comptime self: *KernelBuilder, comptime target: []const u8) void {
         self.line("bra " ++ target ++ ";");
@@ -2240,13 +2297,15 @@ pub const KernelBuilder = struct {
     }
     pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         self.validateForm(.{ .op = .atom, .space = space, .ty = ty, .atom_op = op });
+        validateMemoryAddressOperand(a, space, ty, "atom address");
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("atom{s}{s}{s} {s}, [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        self.line(std.fmt.comptimePrint("atom{s}{s}{s} {s}, {s}, {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(dst), fmtAddr(a), fmtOp(b) }));
         return dst;
     }
     pub fn red(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
         self.validateForm(.{ .op = .red, .space = space, .ty = ty, .atom_op = op });
-        self.line(std.fmt.comptimePrint("red{s}{s}{s} [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
+        validateMemoryAddressOperand(a, space, ty, "red address");
+        self.line(std.fmt.comptimePrint("red{s}{s}{s} {s}, {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtAddr(a), fmtOp(b) }));
     }
     pub fn vote(comptime self: *KernelBuilder, comptime mode: VoteMode, a: anytype) Reg(PtxType.b32) {
         const dst = self.tmp(PtxType.b32);
@@ -2491,7 +2550,8 @@ pub const KernelBuilder = struct {
     }
     pub fn tcgen05(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype, size: anytype) void {
         self.validateTarget(.tcgen05);
-        self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 [{s}], {s};", .{ op.suffix(), fmtOp(addr_op), fmtOp(size) }));
+        validateOperandStateSpace(addr_op, .shared, "tcgen05 address");
+        self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 {s}, {s};", .{ op.suffix(), fmtAddr(addr_op), fmtOp(size) }));
     }
     pub fn mma(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
         self.validateForm(.{ .op = .mma, .ty = d_ty });
@@ -2511,17 +2571,20 @@ pub const KernelBuilder = struct {
     }
     pub fn ldu(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype) Reg(ty) {
         self.validateForm(.{ .op = .ldu, .space = .global, .ty = ty });
+        validateMemoryAddressOperand(addr_op, .global, ty, "ldu address");
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, [{s}];", .{ ty.suffix(), fmtOp(dst), fmtOp(addr_op) }));
+        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtAddr(addr_op) }));
         return dst;
     }
     pub fn prefetch(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
         self.validateForm(.{ .op = .prefetch, .space = .global, .ty = PtxType.b8 });
-        self.line(std.fmt.comptimePrint("prefetch.global{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
+        validateOperandStateSpace(addr_op, .global, "prefetch address");
+        self.line(std.fmt.comptimePrint("prefetch.global{s} {s};", .{ level.suffix(), fmtAddr(addr_op) }));
     }
     pub fn prefetchu(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
         self.validateForm(.{ .op = .prefetchu, .space = .global, .ty = PtxType.b8 });
-        self.line(std.fmt.comptimePrint("prefetchu{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
+        validateOperandStateSpace(addr_op, .global, "prefetchu address");
+        self.line(std.fmt.comptimePrint("prefetchu{s} {s};", .{ level.suffix(), fmtAddr(addr_op) }));
     }
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
         self.validateForm(.{ .op = .isspacep, .space = space, .ty = PtxType.pred });
@@ -2537,12 +2600,14 @@ pub const KernelBuilder = struct {
     pub fn cp_async_bulk(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype, flag: anytype) void {
         validateOperandStateSpace(dst, .shared, "cp.async.bulk destination");
         validateOperandStateSpace(src, .global, "cp.async.bulk source");
+        validateOperandStateSpace(flag, .shared, "cp.async.bulk barrier flag");
         self.validateForm(.{ .op = .cp_async_bulk, .space = .shared, .ty = PtxType.b8 });
-        self.line(std.fmt.comptimePrint("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag [{s}], [{s}], {s}, [{s}];", .{ fmtOp(dst), fmtOp(src), fmtOp(size), fmtOp(flag) }));
+        self.line(std.fmt.comptimePrint("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag {s}, {s}, {s}, {s};", .{ fmtAddr(dst), fmtAddr(src), fmtOp(size), fmtAddr(flag) }));
     }
     pub fn mbarrier(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype) void {
         self.validateTarget(.mbarrier);
-        self.line(std.fmt.comptimePrint("mbarrier{s}.shared.b64 [{s}];", .{ op.suffix(), fmtOp(addr_op) }));
+        validateOperandStateSpace(addr_op, .shared, "mbarrier address");
+        self.line(std.fmt.comptimePrint("mbarrier{s}.shared.b64 {s};", .{ op.suffix(), fmtAddr(addr_op) }));
     }
 
     pub fn fabric_submit(comptime self: *KernelBuilder, comptime scope: Scope, a: anytype, b: anytype) Reg(PtxType.b32) {
@@ -2800,6 +2865,88 @@ test "module const and global declarations emit before entries" {
     const entry_pos = std.mem.indexOf(u8, result, ".entry ordering").?;
     try std.testing.expect(const_pos < entry_pos);
     try std.testing.expect(global_pos < entry_pos);
+}
+
+test "typed pointer address formatting verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn ptr_format(k: *ptx.KernelBuilder) void {
+            const addr = k.tmp(PtxType.b64);
+            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr, .offset = 4 };
+            const r0 = k.tmp(PtxType.b32);
+            k.st(.global, PtxType.b32, ptr, r0);
+            _ = k.ld(.global, PtxType.b32, ptr);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.global.b32 [%rd0+4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.global.b32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[[%rd0+4]]") == null);
+}
+
+test "typed pointer negative offset formatting verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn ptr_negative_offset(k: *ptx.KernelBuilder) void {
+            const addr = k.tmp(PtxType.b64);
+            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr, .offset = -4 };
+            _ = k.ld(.global, PtxType.b32, ptr);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "[%rd0-4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[%rd0+-4]") == null);
+}
+
+test "typed pointer validation accepts same-width aliases" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const state = m.allocGlobal(PtxType.b32, "state_alias", 1, 4);
+            const k = m.entry("same_width_alias", .{});
+            _ = k.ld(.global, PtxType.u32, state);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.global.u32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[state_alias]") != null);
+}
+
+test "compile-fail validation rejects typed pointer state mismatch" {
+    try expectCompileFail(
+        "typed_pointer_state_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const addr = k.tmp(ptx.PtxType.b64);
+        \\                const ptr = ptx.Ptr(.local, ptx.PtxType.b32){ .reg = addr };
+        \\                _ = k.ld(.global, ptx.PtxType.b32, ptr);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "ld address must be in global state space, got local",
+    );
+}
+
+test "compile-fail validation rejects typed pointer width mismatch" {
+    try expectCompileFail(
+        "typed_pointer_width_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const addr = k.tmp(ptx.PtxType.b64);
+        \\                const ptr = ptx.Ptr(.global, ptx.PtxType.b64){ .reg = addr };
+        \\                _ = k.ld(.global, ptx.PtxType.b32, ptr);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "ld address element width mismatch: expected .b32, got .b64",
+    );
 }
 
 test "unified library verification" {
