@@ -1585,6 +1585,8 @@ fn validateInstructionForm(comptime ctx: InstructionContext) void {
             if (!containsU32(form.allowed_copy_sizes, copy_size)) {
                 @compileError(std.fmt.comptimePrint("Illegal copy size for {s}: {d}", .{ @tagName(ctx.op), copy_size }));
             }
+        } else {
+            @compileError("Copy size for " ++ @tagName(ctx.op) ++ " must be a comptime u32 immediate");
         }
     }
 }
@@ -2615,6 +2617,58 @@ pub fn build(comptime opt: ModuleOptions, comptime definition: anytype) [:0]cons
 
 // --- Tests ---
 
+fn expectCompileFail(
+    comptime name: []const u8,
+    comptime snippet: []const u8,
+    comptime expected_error: []const u8,
+) !void {
+    const allocator = std.testing.allocator;
+    const file_name = ".ptx_zig_compile_fail_" ++ name ++ ".zig";
+    const source =
+        "const ptx = @import(\"src/root.zig\");\n" ++
+        "test \"compile fail " ++ name ++ "\" {\n" ++
+        "    comptime {\n" ++
+        snippet ++
+        "    }\n" ++
+        "}\n";
+
+    const cwd = std.Io.Dir.cwd();
+    const io = std.testing.io;
+
+    cwd.access(io, "src/root.zig", .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+
+    try cwd.writeFile(io, .{
+        .sub_path = file_name,
+        .data = source,
+    });
+    defer cwd.deleteFile(io, file_name) catch {};
+
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "test", file_name, "--test-no-exec" },
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| try std.testing.expect(code != 0),
+        else => return error.UnexpectedChildExit,
+    }
+
+    if (std.mem.indexOf(u8, result.stderr, expected_error) == null) {
+        std.debug.print(
+            "\nexpected compile error substring:\n{s}\n\nstdout:\n{s}\n\nstderr:\n{s}\n",
+            .{ expected_error, result.stdout, result.stderr },
+        );
+        return error.ExpectedCompileErrorSubstringNotFound;
+    }
+}
+
 test "unified library verification" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
@@ -2788,4 +2842,121 @@ test "instruction form validation carries ptx version into kernels" {
 
     try std.testing.expect(std.mem.indexOf(u8, result, ".version 9.0") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "cp.async.bulk.shared::cluster.global") != null);
+}
+
+test "compile-fail validation rejects invalid load state space" {
+    try expectCompileFail(
+        "invalid_ld_space",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                _ = k.ld(.tex, ptx.PtxType.b32, "addr");
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Illegal PTX state space for ld: tex",
+    );
+}
+
+test "compile-fail validation rejects invalid memory vector size" {
+    try expectCompileFail(
+        "invalid_memory_vector_size",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const ty = ptx.PtxType{ .scalar = .b32, .vec = .v8 };
+        \\                _ = k.ld(.global, ty, "addr");
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Illegal vector size for PTX opcode ld.v8.b32",
+    );
+}
+
+test "compile-fail validation rejects invalid cp.async copy size" {
+    try expectCompileFail(
+        "invalid_cp_async_size",
+        \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
+        \\                const src = k.tmp(ptx.PtxType.b64);
+        \\                k.cp_async(dst, src, 12);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Illegal copy size for cp_async: 12",
+    );
+}
+
+test "compile-fail validation rejects non-immediate cp.async copy size" {
+    try expectCompileFail(
+        "non_immediate_cp_async_size",
+        \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
+        \\                const src = k.tmp(ptx.PtxType.b64);
+        \\                const n = k.tmp(ptx.PtxType.u32);
+        \\                k.cp_async(dst, src, n);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Copy size for cp_async must be a comptime u32 immediate",
+    );
+}
+
+test "compile-fail validation rejects cp.async typed source state space" {
+    try expectCompileFail(
+        "invalid_cp_async_source_space",
+        \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
+        \\                const src = ptx.Ptr(.local, ptx.PtxType.b8){ .reg = k.tmp(ptx.PtxType.b64) };
+        \\                k.cp_async(dst, src, 16);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "cp.async source must be in global state space, got local",
+    );
+}
+
+test "compile-fail validation rejects target gated cp.async" {
+    try expectCompileFail(
+        "target_gated_cp_async",
+        \\        _ = ptx.build(.{ .target = .sm_75 }, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
+        \\                const src = k.tmp(ptx.PtxType.b64);
+        \\                k.cp_async(dst, src, 16);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "PTX opcode cp_async is not supported by target sm_75",
+    );
+}
+
+test "compile-fail validation rejects invalid red cas form" {
+    try expectCompileFail(
+        "invalid_red_cas",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const addr = k.tmp(ptx.PtxType.b64);
+        \\                const val = k.tmp(ptx.PtxType.u32);
+        \\                k.red(.cas, .global, ptx.PtxType.u32, addr, val);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Illegal PTX atomic/reduction form: red.cas.u32",
+    );
 }
