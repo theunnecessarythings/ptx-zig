@@ -1,0 +1,1307 @@
+[
+  {
+    "opcode": "add",
+    "category": "Integer Arithmetic",
+    "syntax": "add{.sat}.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "sub",
+    "category": "Integer Arithmetic",
+    "syntax": "sub{.sat}.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "mul",
+    "category": "Integer Arithmetic",
+    "syntax": "mul{.hi,.lo,.wide}.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [".hi", ".lo", ".wide"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "mad",
+    "category": "Integer Arithmetic",
+    "syntax": "mad{.hi,.lo,.wide}{.sat}.type d, a, b, c;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [".hi", ".lo", ".wide", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "clmad",
+    "category": "Integer Arithmetic",
+    "syntax": "clmad.type d, a, b, c;",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "7.0",
+    "target_sm": "sm_80"
+  },
+  {
+    "opcode": "mul24",
+    "category": "Integer Arithmetic",
+    "syntax": "mul24{.hi,.lo}.type d, a, b;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".hi", ".lo"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "mad24",
+    "category": "Integer Arithmetic",
+    "syntax": "mad24{.hi,.lo}{.sat}.type d, a, b, c;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".hi", ".lo", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "sad",
+    "category": "Integer Arithmetic",
+    "syntax": "sad.type d, a, b, c;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "div",
+    "category": "Integer Arithmetic",
+    "syntax": "div.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "rem",
+    "category": "Integer Arithmetic",
+    "syntax": "rem.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "abs",
+    "category": "Integer Arithmetic",
+    "syntax": "abs.type d, a;",
+    "legal_types": [".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "neg",
+    "category": "Integer Arithmetic",
+    "syntax": "neg.type d, a;",
+    "legal_types": [".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "min",
+    "category": "Integer Arithmetic",
+    "syntax": "min.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "max",
+    "category": "Integer Arithmetic",
+    "syntax": "max.type d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "popc",
+    "category": "Integer Arithmetic",
+    "syntax": "popc.type d, a;",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "clz",
+    "category": "Integer Arithmetic",
+    "syntax": "clz.type d, a;",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "bfind",
+    "category": "Integer Arithmetic",
+    "syntax": "bfind{.shiftamt}.type d, a;",
+    "legal_types": [".u32", ".u64", ".s32", ".s64"],
+    "modifiers": [".shiftamt"],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "fns",
+    "category": "Integer Arithmetic",
+    "syntax": "fns.b32 d, a, b, c;",
+    "legal_types": [".b32"],
+    "modifiers": [],
+    "ptx_version": "6.0",
+    "target_sm": "sm_70"
+  },
+  {
+    "opcode": "brev",
+    "category": "Integer Arithmetic",
+    "syntax": "brev.type d, a;",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "bfe",
+    "category": "Integer Arithmetic",
+    "syntax": "bfe.type d, a, b, c;",
+    "legal_types": [".u32", ".u64", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "2.3",
+    "target_sm": "sm_30"
+  },
+  {
+    "opcode": "bfi",
+    "category": "Integer Arithmetic",
+    "syntax": "bfi.b32 d, a, b, c, d;",
+    "legal_types": [".b32"],
+    "modifiers": [],
+    "ptx_version": "2.3",
+    "target_sm": "sm_30"
+  },
+  {
+    "opcode": "szext",
+    "category": "Integer Arithmetic",
+    "syntax": "szext.type d, a, b;",
+    "legal_types": [".u32", ".s32", ".u64", ".s64"],
+    "modifiers": [],
+    "ptx_version": "7.6",
+    "target_sm": "sm_80"
+  },
+  {
+    "opcode": "bmsk",
+    "category": "Integer Arithmetic",
+    "syntax": "bmsk.type d, a, b;",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "7.6",
+    "target_sm": "sm_80"
+  },
+  {
+    "opcode": "dp4a",
+    "category": "Integer Arithmetic",
+    "syntax": "dp4a.type d, a, b, c;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [],
+    "ptx_version": "5.0",
+    "target_sm": "sm_61"
+  },
+  {
+    "opcode": "dp2a",
+    "category": "Integer Arithmetic",
+    "syntax": "dp2a.type d, a, b, c;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".lo", ".hi"],
+    "ptx_version": "5.0",
+    "target_sm": "sm_61"
+  },
+  {
+    "opcode": "add.cc",
+    "category": "Extended-Precision Integer",
+    "syntax": "add.cc.type d, a, b;",
+    "legal_types": [".u32", ".s32", ".u64", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.2 (u32/s32), 4.3 (u64/s64)",
+    "target_sm": "sm_12 (u32/s32), sm_35 (u64/s64)"
+  },
+  {
+    "opcode": "addc",
+    "category": "Extended-Precision Integer",
+    "syntax": "addc{.cc}.type d, a, b;",
+    "legal_types": [".u32", ".s32", ".u64", ".s64"],
+    "modifiers": [".cc"],
+    "ptx_version": "1.2 (u32/s32), 4.3 (u64/s64)",
+    "target_sm": "sm_12 (u32/s32), sm_35 (u64/s64)"
+  },
+  {
+    "opcode": "sub.cc",
+    "category": "Extended-Precision Integer",
+    "syntax": "sub.cc.type d, a, b;",
+    "legal_types": [".u32", ".s32", ".u64", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.2 (u32/s32), 4.3 (u64/s64)",
+    "target_sm": "sm_12 (u32/s32), sm_35 (u64/s64)"
+  },
+  {
+    "opcode": "subc",
+    "category": "Extended-Precision Integer",
+    "syntax": "subc{.cc}.type d, a, b;",
+    "legal_types": [".u32", ".s32", ".u64", ".s64"],
+    "modifiers": [".cc"],
+    "ptx_version": "1.2 (u32/s32), 4.3 (u64/s64)",
+    "target_sm": "sm_12 (u32/s32), sm_35 (u64/s64)"
+  },
+  {
+    "opcode": "mad.cc",
+    "category": "Extended-Precision Integer",
+    "syntax": "mad.cc.type d, a, b, c;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [],
+    "ptx_version": "3.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "madc",
+    "category": "Extended-Precision Integer",
+    "syntax": "madc{.cc}.type d, a, b, c;",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".cc"],
+    "ptx_version": "3.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "testp",
+    "category": "Floating-Point",
+    "syntax": "testp.op.type p, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".finite", ".infinite", ".number", ".notanumber", ".normal", ".subnormal"],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "copysign",
+    "category": "Floating-Point",
+    "syntax": "copysign.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "add",
+    "category": "Floating-Point",
+    "syntax": "add{.rnd}{.ftz}{.nan}{.sat}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".rn", ".rz", ".rm", ".rp", ".ftz", ".nan", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "sub",
+    "category": "Floating-Point",
+    "syntax": "sub{.rnd}{.ftz}{.nan}{.sat}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".rn", ".rz", ".rm", ".rp", ".ftz", ".nan", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "mul",
+    "category": "Floating-Point",
+    "syntax": "mul{.rnd}{.ftz}{.nan}{.sat}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".rn", ".rz", ".rm", ".rp", ".ftz", ".nan", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "fma",
+    "category": "Floating-Point",
+    "syntax": "fma.rnd{.ftz}{.nan}{.sat}.type d, a, b, c;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".rn", ".rz", ".rm", ".rp", ".ftz", ".nan", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "mad",
+    "category": "Floating-Point",
+    "syntax": "mad.rnd{.ftz}{.nan}{.sat}.type d, a, b, c;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".rn", ".rz", ".rm", ".rp", ".ftz", ".nan", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "div",
+    "category": "Floating-Point",
+    "syntax": "div{.approx,.full}{.rnd}{.ftz}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".approx", ".full", ".rnd", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "abs",
+    "category": "Floating-Point",
+    "syntax": "abs{.ftz}.type d, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "neg",
+    "category": "Floating-Point",
+    "syntax": "neg{.ftz}.type d, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "min",
+    "category": "Floating-Point",
+    "syntax": "min{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".ftz", ".nan"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "max",
+    "category": "Floating-Point",
+    "syntax": "max{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".ftz", ".nan"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "rcp",
+    "category": "Floating-Point",
+    "syntax": "rcp{.approx,.rn}{.ftz}.type d, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".approx", ".rn", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "sqrt",
+    "category": "Floating-Point",
+    "syntax": "sqrt{.approx,.rn}{.ftz}.type d, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".approx", ".rn", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "rsqrt",
+    "category": "Floating-Point",
+    "syntax": "rsqrt{.approx}.ftz.type d, a;",
+    "legal_types": [".f32", ".f64"],
+    "modifiers": [".approx", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "sin",
+    "category": "Floating-Point",
+    "syntax": "sin.approx{.ftz}.f32 d, a;",
+    "legal_types": [".f32"],
+    "modifiers": [".approx", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "cos",
+    "category": "Floating-Point",
+    "syntax": "cos.approx{.ftz}.f32 d, a;",
+    "legal_types": [".f32"],
+    "modifiers": [".approx", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "lg2",
+    "category": "Floating-Point",
+    "syntax": "lg2.approx{.ftz}.f32 d, a;",
+    "legal_types": [".f32"],
+    "modifiers": [".approx", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "ex2",
+    "category": "Floating-Point",
+    "syntax": "ex2.approx{.ftz}.f32 d, a;",
+    "legal_types": [".f32"],
+    "modifiers": [".approx", ".ftz"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "tanh",
+    "category": "Floating-Point",
+    "syntax": "tanh.approx.f32 d, a;",
+    "legal_types": [".f32"],
+    "modifiers": [".approx"],
+    "ptx_version": "7.0",
+    "target_sm": "sm_75"
+  },
+  {
+    "opcode": "add",
+    "category": "Half Precision Floating-Point",
+    "syntax": "add{.rnd}{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".rn", ".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "sub",
+    "category": "Half Precision Floating-Point",
+    "syntax": "sub{.rnd}{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".rn", ".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "mul",
+    "category": "Half Precision Floating-Point",
+    "syntax": "mul{.rnd}{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".rn", ".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "fma",
+    "category": "Half Precision Floating-Point",
+    "syntax": "fma.rn{.ftz}{.nan}.type d, a, b, c;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".rn", ".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "neg",
+    "category": "Half Precision Floating-Point",
+    "syntax": "neg{.ftz}.type d, a;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".ftz"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "abs",
+    "category": "Half Precision Floating-Point",
+    "syntax": "abs{.ftz}.type d, a;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".ftz"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "min",
+    "category": "Half Precision Floating-Point",
+    "syntax": "min{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "max",
+    "category": "Half Precision Floating-Point",
+    "syntax": "max{.ftz}{.nan}.type d, a, b;",
+    "legal_types": [".f16", ".f16x2", ".bf16", ".bf16x2"],
+    "modifiers": [".ftz", ".nan"],
+    "ptx_version": "4.2 (.f16), 7.0 (.bf16)",
+    "target_sm": "sm_53 (.f16), sm_80 (.bf16)"
+  },
+  {
+    "opcode": "ex2",
+    "category": "Half Precision Floating-Point",
+    "syntax": "ex2.approx.type d, a;",
+    "legal_types": [".f16", ".f16x2"],
+    "modifiers": [".approx"],
+    "ptx_version": "7.0",
+    "target_sm": "sm_75"
+  },
+  {
+    "opcode": "set",
+    "category": "Comparison and Selection",
+    "syntax": "set.compare.type.src2 d, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64", ".f32", ".f64"],
+    "modifiers": [".eq", ".ne", ".lt", ".le", ".gt", ".ge", ".num", ".nan"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "setp",
+    "category": "Comparison and Selection",
+    "syntax": "setp.compare.type p{|q}, a, b;",
+    "legal_types": [".u16", ".u32", ".u64", ".s16", ".s32", ".s64", ".f32", ".f64"],
+    "modifiers": [".eq", ".ne", ".lt", ".le", ".gt", ".ge", ".num", ".nan"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "selp",
+    "category": "Comparison and Selection",
+    "syntax": "selp.type d, a, b, c;",
+    "legal_types": [".b16", ".b32", ".b64", ".u16", ".u32", ".u64", ".s16", ".s32", ".s64", ".f32", ".f64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "slct",
+    "category": "Comparison and Selection",
+    "syntax": "slct.dtype.stype d, a, b, c;",
+    "legal_types": [".b16", ".b32", ".b64", ".u16", ".u32", ".u64", ".s16", ".s32", ".s64", ".f32", ".f64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "and",
+    "category": "Logic and Shift",
+    "syntax": "and.type d, a, b;",
+    "legal_types": [".pred", ".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "or",
+    "category": "Logic and Shift",
+    "syntax": "or.type d, a, b;",
+    "legal_types": [".pred", ".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "xor",
+    "category": "Logic and Shift",
+    "syntax": "xor.type d, a, b;",
+    "legal_types": [".pred", ".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "not",
+    "category": "Logic and Shift",
+    "syntax": "not.type d, a;",
+    "legal_types": [".pred", ".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "cnot",
+    "category": "Logic and Shift",
+    "syntax": "cnot.type d, a;",
+    "legal_types": [".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "lop3",
+    "category": "Logic and Shift",
+    "syntax": "lop3.b32 d, a, b, c, imm;",
+    "legal_types": [".b32"],
+    "modifiers": [],
+    "ptx_version": "4.3",
+    "target_sm": "sm_50"
+  },
+  {
+    "opcode": "shf",
+    "category": "Logic and Shift",
+    "syntax": "shf.l.mode.b32 d, a, b, c;",
+    "legal_types": [".b32"],
+    "modifiers": [".l", ".r", ".clamp", ".wrap"],
+    "ptx_version": "3.1",
+    "target_sm": "sm_32"
+  },
+  {
+    "opcode": "shl",
+    "category": "Logic and Shift",
+    "syntax": "shl.type d, a, b;",
+    "legal_types": [".b16", ".b32", ".b64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "shr",
+    "category": "Logic and Shift",
+    "syntax": "shr.type d, a, b;",
+    "legal_types": [".b16", ".b32", ".b64", ".u16", ".u32", ".u64", ".s16", ".s32", ".s64"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "mov",
+    "category": "Data Movement and Conversion",
+    "syntax": "mov.type d, a;",
+    "legal_types": ["All scalar types"],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "shfl.sync",
+    "category": "Data Movement and Conversion",
+    "syntax": "shfl.sync.mode.b32 d{|p}, a, b, c;",
+    "legal_types": [".b32"],
+    "modifiers": [".up", ".down", ".bfly", ".idx"],
+    "ptx_version": "6.0",
+    "target_sm": "sm_30"
+  },
+  {
+    "opcode": "prmt",
+    "category": "Data Movement and Conversion",
+    "syntax": "prmt.b32.mode d, a, b, c;",
+    "legal_types": [".b32"],
+    "modifiers": [".f4e", ".b4e", ".rc8", ".ecl", ".ecr"],
+    "ptx_version": "2.0",
+    "target_sm": "sm_20"
+  },
+  {
+    "opcode": "ld",
+    "category": "Data Movement and Conversion",
+    "syntax": "ld{.ss}{.cop}{.vec}.type d, [a];",
+    "legal_types": ["All scalar types"],
+    "modifiers": [".global", ".local", ".shared", ".const", ".param", ".ca", ".cg", ".cs", ".lu", ".cv"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "st",
+    "category": "Data Movement and Conversion",
+    "syntax": "st{.ss}{.cop}{.vec}.type [a], b;",
+    "legal_types": ["All scalar types"],
+    "modifiers": [".global", ".local", ".shared", ".param", ".wb", ".cg", ".cs", ".wt"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "cvt",
+    "category": "Data Movement and Conversion",
+    "syntax": "cvt{.irnd}{.ftz}{.sat}.dtype.stype d, a;",
+    "legal_types": ["All scalar types"],
+    "modifiers": [".rni", ".rzi", ".rmi", ".rpi", ".ftz", ".sat"],
+    "ptx_version": "1.0",
+    "target_sm": "All"
+  },
+  {
+    "opcode": "cp.async",
+    "category": "Data Movement and Conversion",
+    "syntax": "cp.async.ca.shared.global [dst], [src], size;",
+    "legal_types": [],
+    "modifiers": [".ca", ".cg"],
+    "ptx_version": "7.0",
+    "target_sm": "sm_80"
+  },
+  {
+    "opcode": "fabric.try_get",
+    "category": "Fabric",
+    "syntax": "fabric.try_get.mode.type d, [a];",
+    "legal_types": [".b32", ".b64"],
+    "modifiers": [".bulk"],
+    "ptx_version": "8.0",
+    "target_sm": "sm_90"
+  },
+  {
+    "opcode": "fabric.submit",
+    "category": "Fabric",
+    "syntax": "fabric.submit.mode;",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "8.0",
+    "target_sm": "sm_90"
+  },
+  {
+    "opcode": "tex",
+    "category": "Texture Instructions",
+    "syntax": "tex.geom.v4.dtype.ctype d, [a, c] [, s] [, o];",
+    "legal_types": ["f16", "f32", "s32", "u32"],
+    "modifiers": [".1d", ".2d", ".3d", ".a1d", ".a2d", ".cube", ".acube", ".2dms", ".a2dms"],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "tld4",
+    "category": "Texture Instructions",
+    "syntax": "tld4.geom.v4.dtype.ctype d, [a, c] [, s] [, o];",
+    "legal_types": ["f16", "f32", "s32", "u32"],
+    "modifiers": [".2d", ".a2d", ".cube", ".acube", ".r", ".g", ".b", ".a"],
+    "ptx_version": "2.2",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "txq",
+    "category": "Texture Instructions",
+    "syntax": "txq.query.dtype d, [a];",
+    "legal_types": ["s32", "u32"],
+    "modifiers": [".width", ".height", ".depth", ".array_size", ".num_samples", ".num_mipmaps"],
+    "ptx_version": "1.5",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "suld",
+    "category": "Surface Instructions",
+    "syntax": "suld.b.geom.mode.dtype.ctype d, [a, c];",
+    "legal_types": ["b8", "b16", "b32", "b64"],
+    "modifiers": [".1d", ".2d", ".3d", ".a1d", ".a2d", ".trap", ".clamp", ".zero"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "sust",
+    "category": "Surface Instructions",
+    "syntax": "sust.b.geom.mode.dtype.ctype [a, c], r;",
+    "legal_types": ["b8", "b16", "b32", "b64"],
+    "modifiers": [".1d", ".2d", ".3d", ".a1d", ".a2d", ".trap", ".clamp", ".zero"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "sured",
+    "category": "Surface Instructions",
+    "syntax": "sured.b.op.geom.mode.dtype.ctype [a, c], r;",
+    "legal_types": ["u32", "u64", "s32", "b32"],
+    "modifiers": [".add", ".min", ".max", ".and", ".or", ".xor", ".trap", ".clamp", ".zero"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "suq",
+    "category": "Surface Instructions",
+    "syntax": "suq.query.dtype d, [a];",
+    "legal_types": ["s32", "u32"],
+    "modifiers": [".width", ".height", ".depth", ".array_size", ".channel_data_type", ".channel_order"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "bra",
+    "category": "Control Flow Instructions",
+    "syntax": "bra{.uni} label;\n@p bra{.uni} label;",
+    "legal_types": [],
+    "modifiers": [".uni"],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "call",
+    "category": "Control Flow Instructions",
+    "syntax": "call{.uni} (ret-regs), func, (param-regs);\ncall{.uni} func, (param-regs);\ncall{.uni} func;",
+    "legal_types": [],
+    "modifiers": [".uni"],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "ret",
+    "category": "Control Flow Instructions",
+    "syntax": "ret{.uni};",
+    "legal_types": [],
+    "modifiers": [".uni"],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "exit",
+    "category": "Control Flow Instructions",
+    "syntax": "exit;",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "discard",
+    "category": "Control Flow Instructions",
+    "syntax": "discard;",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "1.3",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "bar",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "bar.sync a {, b};\nbar.arrive a, b;\nbar.red.popc.u32 d, a, b, {p};",
+    "legal_types": ["u32"],
+    "modifiers": [".sync", ".arrive", ".red", ".popc", ".and", ".or"],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "membar",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "membar.level;",
+    "legal_types": [],
+    "modifiers": [".cta", ".gpu", ".sys"],
+    "ptx_version": "1.4",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "atom",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "atom{.space}.op.type d, [a], b;\natom{.space}.op.type d, [a], b, c;",
+    "legal_types": ["u32", "u64", "s32", "s64", "f32", "f64"],
+    "modifiers": [".global", ".shared", ".add", ".sub", ".inc", ".dec", ".min", ".max", ".and", ".or", ".xor", ".cas", ".exch"],
+    "ptx_version": "1.0",
+    "target_sm": "11"
+  },
+  {
+    "opcode": "red",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "red{.space}.op.type [a], b;",
+    "legal_types": ["u32", "u64", "s32", "s64", "f32", "f64"],
+    "modifiers": [".global", ".shared", ".add", ".min", ".max", ".and", ".or", ".xor"],
+    "ptx_version": "1.2",
+    "target_sm": "11"
+  },
+  {
+    "opcode": "vote",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "vote.mode.b32 d, {p}, a;",
+    "legal_types": ["b32"],
+    "modifiers": [".all", ".any", ".uni", ".ballot"],
+    "ptx_version": "1.2",
+    "target_sm": "12"
+  },
+  {
+    "opcode": "match",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "match.mode.b32 d, a;\nmatch.mode.b64 d, a;",
+    "legal_types": ["b32", "b64"],
+    "modifiers": [".any", ".all"],
+    "ptx_version": "6.0",
+    "target_sm": "70"
+  },
+  {
+    "opcode": "mbarrier",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "mbarrier.init.shared.b64 [addr], count;\nmbarrier.arrive.shared.b64 state, [addr];\nmbarrier.test_wait.shared.b64 wait, [addr], state;",
+    "legal_types": ["b64"],
+    "modifiers": [".init", ".arrive", ".test_wait", ".pending_count", ".shared"],
+    "ptx_version": "7.0",
+    "target_sm": "80"
+  },
+  {
+    "opcode": "barrier",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "barrier.cluster.arrive;\nbarrier.cluster.wait;\nbarrier.cluster.aligned.arrive;\nbarrier.cluster.aligned.wait;",
+    "legal_types": [],
+    "modifiers": [".cluster", ".aligned", ".arrive", ".wait"],
+    "ptx_version": "7.8",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "redux",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "redux.sync.op.type d, a, mask;",
+    "legal_types": ["u32", "s32", "b32"],
+    "modifiers": [".add", ".min", ".max", ".and", ".or", ".xor"],
+    "ptx_version": "7.0",
+    "target_sm": "80"
+  },
+  {
+    "opcode": "grpbarrier",
+    "category": "Parallel Synchronization and Communication Instructions",
+    "syntax": "grpbarrier.arrive.shared.b64 [addr], count;\ngrpbarrier.wait.shared.b64 [addr], state;",
+    "legal_types": ["b64"],
+    "modifiers": [".arrive", ".wait", ".shared"],
+    "ptx_version": "8.2",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "mma",
+    "category": "Warp Level Matrix Multiply-Accumulate Instructions",
+    "syntax": "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 d, a, b, c;",
+    "legal_types": ["f16", "f32", "bf16", "tf32", "u8", "s8", "u4", "s4", "b1"],
+    "modifiers": [".m16n8k8", ".m16n8k16", ".m16n8k32", ".m8n8k4", ".row", ".col", ".satfinite"],
+    "ptx_version": "6.4",
+    "target_sm": "70"
+  },
+  {
+    "opcode": "wgmma.mma_async",
+    "category": "Asynchronous Warpgroup Level Matrix Multiply-Accumulate Instructions",
+    "syntax": "wgmma.mma_async.m64n128k16.f32.f16.f16 d, a, b, c;",
+    "legal_types": ["f16", "bf16", "tf32", "f32", "u8", "s8"],
+    "modifiers": [".m64n128k16", ".m64n64k16", ".row", ".col", ".f32", ".f16", ".bf16"],
+    "ptx_version": "8.0",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "tcgen05",
+    "category": "TensorCore 5th Generation Family Instructions",
+    "syntax": "tcgen05.commit.cta_group.b64 [addr];\ntcgen05.wait.cta_group.b64 [addr];",
+    "legal_types": ["b64"],
+    "modifiers": [".commit", ".wait", ".cta_group"],
+    "ptx_version": "8.3",
+    "target_sm": "100"
+  },
+  {
+    "opcode": "stacksave",
+    "category": "Stack Manipulation Instructions",
+    "syntax": "stacksave.type d;",
+    "legal_types": ["u32", "u64"],
+    "modifiers": [],
+    "ptx_version": "7.3",
+    "target_sm": "52"
+  },
+  {
+    "opcode": "stackrestore",
+    "category": "Stack Manipulation Instructions",
+    "syntax": "stackrestore.type a;",
+    "legal_types": ["u32", "u64"],
+    "modifiers": [],
+    "ptx_version": "7.3",
+    "target_sm": "52"
+  },
+  {
+    "opcode": "alloca",
+    "category": "Stack Manipulation Instructions",
+    "syntax": "alloca.type d, size {, alignment};",
+    "legal_types": ["u32", "u64"],
+    "modifiers": [],
+    "ptx_version": "7.3",
+    "target_sm": "52"
+  },
+  {
+    "opcode": "vadd",
+    "category": "Video Instructions",
+    "syntax": "vadd.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vsub",
+    "category": "Video Instructions",
+    "syntax": "vsub.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vabsdiff",
+    "category": "Video Instructions",
+    "syntax": "vabsdiff.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmin",
+    "category": "Video Instructions",
+    "syntax": "vmin.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmax",
+    "category": "Video Instructions",
+    "syntax": "vmax.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vshl",
+    "category": "Video Instructions",
+    "syntax": "vshl.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat", ".clamp"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vshr",
+    "category": "Video Instructions",
+    "syntax": "vshr.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat", ".clamp"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmad",
+    "category": "Video Instructions",
+    "syntax": "vmad.dtype.atype.btype{.sat}{.relop} d, a, b, c;",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".sat"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vset",
+    "category": "Video Instructions",
+    "syntax": "vset.dtype.atype.btype.relop d, a, b {, c};",
+    "legal_types": ["u32", "s32"],
+    "modifiers": [".u32", ".s32", ".eq", ".ne", ".lt", ".le", ".gt", ".ge"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "trap",
+    "category": "Miscellaneous Instructions",
+    "syntax": "trap;",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "brkpt",
+    "category": "Miscellaneous Instructions",
+    "syntax": "brkpt;",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "1.0",
+    "target_sm": "10"
+  },
+  {
+    "opcode": "pmevent",
+    "category": "Miscellaneous Instructions",
+    "syntax": "pmevent a;",
+    "legal_types": ["u32"],
+    "modifiers": [],
+    "ptx_version": "1.4",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "setmaxnreg",
+    "category": "Miscellaneous Instructions",
+    "syntax": "setmaxnreg.mode.u32 count;",
+    "legal_types": ["u32"],
+    "modifiers": [".dec", ".inc"],
+    "ptx_version": "8.0",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "setmaxhreg",
+    "category": "Miscellaneous Instructions",
+    "syntax": "setmaxhreg.u32 count;",
+    "legal_types": ["u32"],
+    "modifiers": [],
+    "ptx_version": "8.0",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "vadd2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vadd2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vadd4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vadd4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vsub2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vsub2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vsub4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vsub4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vavrg2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vavrg2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vavrg4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vavrg4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vabsdiff2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vabsdiff2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vabsdiff4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vabsdiff4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmin2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vmin2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmin4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vmin4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmax2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vmax2.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vmax4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vmax4.dtype.atype.btype{.sat}{.relop} d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".sat", ".add", ".min", ".max"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vset2",
+    "category": "SIMD Video Instructions",
+    "syntax": "vset2.dtype.atype.btype.relop d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".eq", ".ne", ".lt", ".le", ".gt", ".ge"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "vset4",
+    "category": "SIMD Video Instructions",
+    "syntax": "vset4.dtype.atype.btype.relop d, a, b {, c};",
+    "legal_types": [".u32", ".s32"],
+    "modifiers": [".eq", ".ne", ".lt", ".le", ".gt", ".ge"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "ldu",
+    "category": "Data Movement",
+    "syntax": "ldu.type d, [a];",
+    "legal_types": ["All scalar types"],
+    "modifiers": [],
+    "ptx_version": "2.0",
+    "target_sm": "30"
+  },
+  {
+    "opcode": "prefetch",
+    "category": "Data Movement",
+    "syntax": "prefetch{.ss}.level [a];",
+    "legal_types": [],
+    "modifiers": [".global", ".local", ".L1", ".L2"],
+    "ptx_version": "2.3",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "prefetchu",
+    "category": "Data Movement",
+    "syntax": "prefetchu.L1 [a];",
+    "legal_types": [],
+    "modifiers": [".L1"],
+    "ptx_version": "3.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "isspacep",
+    "category": "Data Movement",
+    "syntax": "isspacep.ss p, a;",
+    "legal_types": [],
+    "modifiers": [".const", ".global", ".local", ".shared", ".param"],
+    "ptx_version": "2.0",
+    "target_sm": "20"
+  },
+  {
+    "opcode": "cvt.pack",
+    "category": "Data Movement",
+    "syntax": "cvt.pack.type d, a, b;",
+    "legal_types": [".f16x2", ".bf16x2", ".u8x4", ".s8x4"],
+    "modifiers": [],
+    "ptx_version": "6.5",
+    "target_sm": "70"
+  },
+  {
+    "opcode": "cp.async.bulk",
+    "category": "Data Movement",
+    "syntax": "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag [dst], [src], size, [flag_addr];",
+    "legal_types": [],
+    "modifiers": [],
+    "ptx_version": "8.0",
+    "target_sm": "90"
+  },
+  {
+    "opcode": "cvta",
+    "category": "Data Movement and Conversion",
+    "syntax": "cvta.to|from.space.type d, a;",
+    "legal_types": [".u32", ".u64"],
+    "modifiers": [".to", ".from", ".global", ".local", ".shared", ".const"],
+    "ptx_version": "2.0",
+    "target_sm": "All"
+  }
+]
