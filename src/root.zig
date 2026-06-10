@@ -1694,6 +1694,30 @@ fn scalarByteSize(comptime scalar: ScalarType) u32 {
     };
 }
 
+fn ptxTypeByteSize(comptime ty: PtxType) u32 {
+    return scalarByteSize(ty.scalar) * @intFromEnum(ty.vec);
+}
+
+fn operandPtxType(comptime operand: anytype) ?PtxType {
+    const T = @TypeOf(operand);
+    switch (@typeInfo(T)) {
+        .@"struct" => {
+            if (T == ParamHandle) return operand.ty;
+            if (@hasDecl(T, "ty")) return T.ty;
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn validateOperandWidth(comptime operand: anytype, comptime expected: PtxType, comptime role: []const u8) void {
+    if (operandPtxType(operand)) |actual| {
+        if (ptxTypeByteSize(actual) != ptxTypeByteSize(expected)) {
+            @compileError(role ++ " width mismatch: expected " ++ expected.suffix() ++ ", got " ++ actual.suffix());
+        }
+    }
+}
+
 fn validateMemoryAddressOperand(
     comptime operand: anytype,
     comptime expected: StateSpace,
@@ -1782,6 +1806,8 @@ pub const KernelBuilder = struct {
     target: Target = .sm_75,
     max_virtual_registers: ?u32 = null,
     param_count: usize = 0,
+    param_types: [256]PtxType = undefined,
+    local_param_count: u32 = 0,
     params_text: []const u8 = "",
     active_predicate: ?[]const u8 = null,
     counts: struct {
@@ -1797,6 +1823,7 @@ pub const KernelBuilder = struct {
         v: u32 = 0,   // %v (others)
     } = .{},
     shared_decls: []const u8 = "",
+    param_decls: []const u8 = "",
     body: []const u8 = "",
 
     pub fn params(comptime self: *KernelBuilder, comptime ps: anytype) ParamsResult(@TypeOf(ps)) {
@@ -1815,6 +1842,7 @@ pub const KernelBuilder = struct {
                 if (i > 0 or self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), name });
                 res[i] = .{ .name = name, .ty = ty };
+                self.param_types[self.param_count] = ty;
                 self.param_count += 1;
             }
             return res;
@@ -1831,6 +1859,7 @@ pub const KernelBuilder = struct {
                 if (self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
                 self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), field.name });
                 @field(res, field.name) = .{ .name = field.name, .ty = ty };
+                self.param_types[self.param_count] = ty;
                 self.param_count += 1;
             }
             return res;
@@ -1952,6 +1981,41 @@ pub const KernelBuilder = struct {
         }
     }
 
+    fn validateCallArgWidths(comptime _: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) void {
+        const info = @typeInfo(@TypeOf(args));
+        if (info != .@"struct") {
+            @compileError("Call arguments must be a tuple or struct");
+        }
+
+        inline for (info.@"struct".fields, 0..) |field, i| {
+            const expected = callee.param_types[i];
+            const actual_arg = @field(args, field.name);
+            if (operandPtxType(actual_arg)) |actual| {
+                if (ptxTypeByteSize(actual) != ptxTypeByteSize(expected)) {
+                    @compileError(std.fmt.comptimePrint(
+                        "Call argument {d} width mismatch for {s}: expected {s}, got {s}",
+                        .{ i, callee.name, expected.suffix(), actual.suffix() },
+                    ));
+                }
+            }
+        }
+    }
+
+    fn marshalCallArgs(comptime self: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) []const u8 {
+        self.validateCallArgCount(callee, args);
+        self.validateCallArgWidths(callee, args);
+
+        const info = @typeInfo(@TypeOf(args));
+        var res: []const u8 = "";
+        inline for (info.@"struct".fields, 0..) |field, i| {
+            const slot = self.tmpParam(callee.param_types[i]);
+            self.stParam(slot, @field(args, field.name));
+            if (i > 0) res = res ++ ", ";
+            res = res ++ fmtOp(slot);
+        }
+        return res;
+    }
+
     pub fn tmp(comptime self: *KernelBuilder, comptime ty: PtxType) Reg(ty) {
         const field_name = switch (ty.scalar) {
             .pred => "p",
@@ -1973,6 +2037,17 @@ pub const KernelBuilder = struct {
 
     pub fn named(comptime _: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8) Reg(ty) {
         return .{ .data = .{ .name = name } };
+    }
+
+    pub fn declParam(comptime self: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8) ParamHandle {
+        self.param_decls = self.param_decls ++ std.fmt.comptimePrint("\t.param {s} {s};\n", .{ ty.suffix(), name });
+        return .{ .name = name, .ty = ty };
+    }
+
+    pub fn tmpParam(comptime self: *KernelBuilder, comptime ty: PtxType) ParamHandle {
+        const name = std.fmt.comptimePrint("__param{d}", .{self.local_param_count});
+        self.local_param_count += 1;
+        return self.declParam(ty, name);
     }
 
     pub fn declReg(comptime self: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8) Reg(ty) {
@@ -2441,12 +2516,35 @@ pub const KernelBuilder = struct {
         return dst;
     }
 
+    pub fn callVoidMarshalled(comptime self: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) void {
+        self.validateCallTarget(callee);
+        if (callee.return_ty != null) {
+            @compileError("Function " ++ callee.name ++ " returns a value; use callRetMarshalled");
+        }
+        const marshalled_args = self.marshalCallArgs(callee, args);
+        self.line("call.uni " ++ callee.name ++ ", (" ++ marshalled_args ++ ");");
+    }
+
+    pub fn callRetMarshalled(comptime self: *KernelBuilder, comptime ret_ty: PtxType, comptime callee: *const KernelBuilder, args: anytype) Reg(ret_ty) {
+        self.validateCallTarget(callee);
+        const callee_ret_ty = callee.return_ty orelse @compileError("Function " ++ callee.name ++ " does not return a value");
+        if (ptxTypeByteSize(ret_ty) != ptxTypeByteSize(callee_ret_ty)) {
+            @compileError("Call return width mismatch for " ++ callee.name ++ ": expected " ++ ret_ty.suffix() ++ ", got " ++ callee_ret_ty.suffix());
+        }
+
+        const ret_slot = self.tmpParam(ret_ty);
+        const marshalled_args = self.marshalCallArgs(callee, args);
+        self.line("call.uni (" ++ fmtOp(ret_slot) ++ "), " ++ callee.name ++ ", (" ++ marshalled_args ++ ");");
+        return self.ldParam(ret_slot);
+    }
+
     pub fn returnParam(comptime self: *KernelBuilder) ParamHandle {
         const ty = self.return_ty orelse @compileError("Function " ++ self.name ++ " does not return a value");
         return .{ .name = self.return_param_name, .ty = ty };
     }
 
     pub fn stParam(comptime self: *KernelBuilder, comptime p: ParamHandle, val: anytype) void {
+        validateOperandWidth(val, p.ty, "st.param value");
         self.line("st.param" ++ p.ty.suffix() ++ " " ++ fmtAddr(p) ++ ", " ++ fmtOp(val) ++ ";");
     }
 
@@ -2796,6 +2894,7 @@ pub const KernelBuilder = struct {
         if (self.entry_directives.len > 0) res = res ++ self.entry_directives;
         res = res ++ "{\n";
         if (self.shared_decls.len > 0) res = res ++ self.shared_decls;
+        if (self.param_decls.len > 0) res = res ++ self.param_decls;
         inline for (std.meta.fields(@TypeOf(self.counts))) |field| {
             const count = @field(self.counts, field.name);
             if (count > 0) {
@@ -3683,5 +3782,117 @@ test "compile-fail validation rejects return width mismatch" {
         \\
         ,
         "Call return width mismatch for answer: expected .u32, got .u64",
+    );
+}
+
+test "marshalled void function call verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const sink = m.func("sink_marshalled", .{ .x = .u32, .y = .u64 });
+            sink.ret();
+
+            const k = m.entry("call_sink_marshalled", .{});
+            const x = k.tmp(PtxType.u32);
+            const y = k.tmp(PtxType.u64);
+            k.callVoidMarshalled(sink, .{ x, y });
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 __param0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u64 __param1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.param.u32 [__param0], %r0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.param.u64 [__param1], %rd0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call.uni sink_marshalled, (__param0, __param1);") != null);
+}
+
+test "marshalled function return call verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const answer = m.funcRet("answer_marshalled", PtxType.u32, .{});
+            answer.retVal(42);
+
+            const k = m.entry("use_answer_marshalled", .{});
+            const r0 = k.callRetMarshalled(PtxType.u32, answer, .{});
+            k.stGlobal(PtxType.u32, "out", r0);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 __param0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call.uni (__param0), answer_marshalled, ();") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [__param0];") != null);
+}
+
+test "declared param slot helper verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn explicit_param_slot(k: *ptx.KernelBuilder) void {
+            const slot = k.declParam(PtxType.u32, "slot0");
+            const r0 = k.tmp(PtxType.u32);
+            k.stParam(slot, r0);
+            _ = k.ldParam(slot);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 slot0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.param.u32 [slot0], %r0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r1, [slot0];") != null);
+}
+
+test "compile-fail validation rejects marshalled argument width mismatch" {
+    try expectCompileFail(
+        "marshalled_argument_width_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const sink = m.func("sink", .{ .x = .u64 });
+        \\                sink.ret();
+        \\                const k = m.entry("invalid", .{});
+        \\                const x = k.tmp(ptx.PtxType.u32);
+        \\                k.callVoidMarshalled(sink, .{x});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Call argument 0 width mismatch for sink: expected .u64, got .u32",
+    );
+}
+
+test "compile-fail validation rejects marshalled void call to returning function" {
+    try expectCompileFail(
+        "marshalled_void_call_to_returning_function",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn emit(m: *ptx.Module) void {
+        \\                const answer = m.funcRet("answer", ptx.PtxType.u32, .{});
+        \\                answer.retVal(1);
+        \\                const k = m.entry("invalid", .{});
+        \\                k.callVoidMarshalled(answer, .{});
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "Function answer returns a value; use callRetMarshalled",
+    );
+}
+
+test "compile-fail validation rejects st.param width mismatch" {
+    try expectCompileFail(
+        "st_param_width_mismatch",
+        \\        _ = ptx.build(.{}, struct {
+        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
+        \\                const slot = k.declParam(ptx.PtxType.u64, "slot0");
+        \\                const x = k.tmp(ptx.PtxType.u32);
+        \\                k.stParam(slot, x);
+        \\                k.ret();
+        \\            }
+        \\        });
+        \\
+        ,
+        "st.param value width mismatch: expected .u64, got .u32",
     );
 }
