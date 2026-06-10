@@ -452,6 +452,39 @@ pub const Target = enum {
     sm_90,
     sm_90a,
     sm_100a,
+
+    pub fn computeCapability(self: Target) struct { major: u32, minor: u32 } {
+        return switch (self) {
+            .sm_50 => .{ .major = 5, .minor = 0 },
+            .sm_52 => .{ .major = 5, .minor = 2 },
+            .sm_53 => .{ .major = 5, .minor = 3 },
+            .sm_60 => .{ .major = 6, .minor = 0 },
+            .sm_61 => .{ .major = 6, .minor = 1 },
+            .sm_62 => .{ .major = 6, .minor = 2 },
+            .sm_70 => .{ .major = 7, .minor = 0 },
+            .sm_72 => .{ .major = 7, .minor = 2 },
+            .sm_75 => .{ .major = 7, .minor = 5 },
+            .sm_80 => .{ .major = 8, .minor = 0 },
+            .sm_86 => .{ .major = 8, .minor = 6 },
+            .sm_87 => .{ .major = 8, .minor = 7 },
+            .sm_89 => .{ .major = 8, .minor = 9 },
+            .sm_90 => .{ .major = 9, .minor = 0 },
+            .sm_90a => .{ .major = 9, .minor = 0 },
+            .sm_100a => .{ .major = 10, .minor = 0 },
+        };
+    }
+
+    pub fn supportsAtLeast(self: Target, comptime major: u32, comptime minor: u32) bool {
+        const cc = self.computeCapability();
+        return cc.major > major or (cc.major == major and cc.minor >= minor);
+    }
+
+    pub fn isAccelerated(self: Target) bool {
+        return switch (self) {
+            .sm_90a, .sm_100a => true,
+            else => false,
+        };
+    }
 };
 
 pub const Version = struct {
@@ -511,6 +544,15 @@ pub fn Ptr(comptime space_: StateSpace, comptime ty_: PtxType) type {
         pub const space = space_;
         pub const ty = ty_;
         reg: Reg(PtxType.b64),
+        offset: i32 = 0,
+    };
+}
+
+pub fn Shared(comptime ty_: PtxType) type {
+    return struct {
+        pub const space = StateSpace.shared;
+        pub const ty = ty_;
+        name: []const u8,
         offset: i32 = 0,
     };
 }
@@ -1290,6 +1332,17 @@ fn fmtOp(comptime op: anytype) []const u8 {
             if (T == ParamHandle) {
                 return std.fmt.comptimePrint("{s}", .{op.name});
             }
+            if (@hasDecl(T, "space") and @hasDecl(T, "ty") and @hasField(T, "name")) {
+                if (T.space == .shared) {
+                    if (op.offset == 0) {
+                        return std.fmt.comptimePrint("{s}", .{op.name});
+                    } else if (op.offset > 0) {
+                        return std.fmt.comptimePrint("{s}+{d}", .{ op.name, op.offset });
+                    } else {
+                        return std.fmt.comptimePrint("{s}{d}", .{ op.name, op.offset });
+                    }
+                }
+            }
             if (@hasDecl(T, "ty") and @hasField(T, "data")) {
                 switch (op.data) {
                     .id => |id| {
@@ -1336,10 +1389,49 @@ fn validate(comptime op: Opcode, comptime ty: PtxType) void {
     }
 }
 
+fn validateStateSpace(comptime op: Opcode, comptime space: StateSpace, comptime ty: PtxType) void {
+    validate(op, ty);
+    switch (op) {
+        .ld => switch (space) {
+            .global, .local, .param, .shared, .const_space => {},
+            else => @compileError("Illegal PTX state space for ld: " ++ @tagName(space)),
+        },
+        .st => switch (space) {
+            .global, .local, .shared => {},
+            else => @compileError("Illegal PTX state space for st: " ++ @tagName(space)),
+        },
+        .atom, .red => switch (space) {
+            .global, .shared => {},
+            else => @compileError("Illegal PTX state space for atomic/reduction op: " ++ @tagName(space)),
+        },
+        .cvta => switch (space) {
+            .global, .local, .shared, .const_space => {},
+            else => @compileError("Illegal PTX state space for cvta: " ++ @tagName(space)),
+        },
+        .isspacep => switch (space) {
+            .global, .local, .shared, .const_space => {},
+            else => @compileError("Illegal PTX state space for isspacep: " ++ @tagName(space)),
+        },
+        else => {},
+    }
+}
+
+fn targetSupports(comptime target: Target, comptime op: Opcode) bool {
+    return switch (op) {
+        .cp_async => target.supportsAtLeast(8, 0),
+        .mma => target.supportsAtLeast(8, 0),
+        .barrier, .grpbarrier, .cp_async_bulk, .mbarrier, .wgmma_mma_async => target.supportsAtLeast(9, 0),
+        .tcgen05 => target == .sm_100a,
+        else => true,
+    };
+}
+
 // --- Kernel Builder ---
 
 pub const KernelBuilder = struct {
     name: []const u8 = "",
+    target: Target = .sm_75,
+    max_virtual_registers: ?u32 = null,
     params_text: []const u8 = "",
     active_predicate: ?[]const u8 = null,
     counts: struct {
@@ -1354,6 +1446,7 @@ pub const KernelBuilder = struct {
         fd: u32 = 0,  // %fd (.f64)
         v: u32 = 0,   // %v (others)
     } = .{},
+    shared_decls: []const u8 = "",
     body: []const u8 = "",
 
     pub fn params(comptime self: *KernelBuilder, comptime ps: anytype) ParamsResult(@TypeOf(ps)) {
@@ -1423,6 +1516,29 @@ pub const KernelBuilder = struct {
         self.active_predicate = old;
     }
 
+    fn validateTarget(comptime self: *KernelBuilder, comptime op: Opcode) void {
+        if (!targetSupports(self.target, op)) {
+            @compileError("PTX opcode " ++ @tagName(op) ++ " is not supported by target " ++ @tagName(self.target));
+        }
+    }
+
+    fn virtualRegisterCount(comptime self: *KernelBuilder) u32 {
+        var total: u32 = 0;
+        inline for (std.meta.fields(@TypeOf(self.counts))) |field| {
+            total += @field(self.counts, field.name);
+        }
+        return total;
+    }
+
+    fn checkRegisterLimit(comptime self: *KernelBuilder) void {
+        if (self.max_virtual_registers) |limit| {
+            const used = self.virtualRegisterCount();
+            if (used > limit) {
+                @compileError(std.fmt.comptimePrint("Kernel {s} uses {d} virtual registers, exceeding configured limit {d}", .{ self.name, used, limit }));
+            }
+        }
+    }
+
     pub fn tmp(comptime self: *KernelBuilder, comptime ty: PtxType) Reg(ty) {
         const field_name = switch (ty.scalar) {
             .pred => "p",
@@ -1438,6 +1554,7 @@ pub const KernelBuilder = struct {
         };
         const id = @field(self.counts, field_name);
         @field(self.counts, field_name) += @intFromEnum(ty.vec);
+        self.checkRegisterLimit();
         return .{ .data = .{ .id = id } };
     }
 
@@ -1448,6 +1565,23 @@ pub const KernelBuilder = struct {
     pub fn declReg(comptime self: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8) Reg(ty) {
         self.line(".reg " ++ ty.suffix() ++ " %" ++ name ++ ";");
         return .{ .data = .{ .name = name } };
+    }
+
+    pub fn allocShared(
+        comptime self: *KernelBuilder,
+        comptime ty: PtxType,
+        comptime name: []const u8,
+        comptime len: u32,
+        comptime alignment: u32,
+    ) Shared(ty) {
+        if (len == 0) @compileError("Shared memory allocation length must be greater than zero");
+        if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
+            @compileError("Shared memory alignment must be a non-zero power of two");
+        }
+        if (ty.scalar == .pred) @compileError("Cannot allocate .pred shared memory");
+
+        self.shared_decls = self.shared_decls ++ std.fmt.comptimePrint("\t.shared .align {d} {s} {s}[{d}];\n", .{ alignment, ty.suffix(), name, len });
+        return .{ .name = name };
     }
 
     pub fn abs(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
@@ -1795,19 +1929,19 @@ pub const KernelBuilder = struct {
         return dst;
     }
     pub fn cvta(comptime self: *KernelBuilder, comptime dir: CvtDirection, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.cvta, ty);
+        validateStateSpace(.cvta, space, ty);
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("cvta{s}{s}{s} {s}, {s};", .{ dir.suffix(), space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn ld(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.ld, ty);
+        validateStateSpace(.ld, space, ty);
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("ld{s}{s} {s}, [{s}];", .{ space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn st(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
-        validate(.st, ty);
+        validateStateSpace(.st, space, ty);
         self.line(std.fmt.comptimePrint("st{s}{s} [{s}], {s};", .{ space.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
     }
     pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
@@ -1837,15 +1971,18 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("bar.sync {s};", .{fmtOp(a)}));
     }
     pub fn barrier(comptime self: *KernelBuilder, comptime op: BarrierOp) void {
+        self.validateTarget(.barrier);
         self.line(std.fmt.comptimePrint("barrier.cluster{s};", .{op.suffix()}));
     }
     pub fn grpbarrier(comptime self: *KernelBuilder) void {
+        self.validateTarget(.grpbarrier);
         self.line("grpbarrier.cluster;");
     }
     pub fn membar(comptime self: *KernelBuilder, comptime level: Scope) void {
         self.line(std.fmt.comptimePrint("membar{s};", .{level.suffix()}));
     }
     pub fn cp_async(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype) void {
+        self.validateTarget(.cp_async);
         self.line(std.fmt.comptimePrint("cp.async.ca.shared.global [{s}], [{s}], {s};", .{ fmtOp(dst), fmtOp(src), fmtOp(size) }));
     }
     pub fn discard(comptime self: *KernelBuilder, addr: anytype, size: anytype) void {
@@ -1863,13 +2000,13 @@ pub const KernelBuilder = struct {
         self.line(s ++ ");");
     }
     pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.atom, ty);
+        validateStateSpace(.atom, space, ty);
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("atom{s}{s}{s} {s}, [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn red(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
-        validate(.red, ty);
+        validateStateSpace(.red, space, ty);
         self.line(std.fmt.comptimePrint("red{s}{s}{s} [{s}], {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
     }
     pub fn vote(comptime self: *KernelBuilder, comptime mode: VoteMode, a: anytype) Reg(PtxType.b32) {
@@ -2114,15 +2251,18 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("setmaxnreg.u32 {s};", .{fmtOp(reg_count)}));
     }
     pub fn tcgen05(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype, size: anytype) void {
+        self.validateTarget(.tcgen05);
         self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 [{s}], {s};", .{ op.suffix(), fmtOp(addr_op), fmtOp(size) }));
     }
     pub fn mma(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
+        self.validateTarget(.mma);
         validate(.mma, d_ty);
         const dst = self.tmp(d_ty);
         self.line(std.fmt.comptimePrint("mma.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
     pub fn wgmma_mma_async(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
+        self.validateTarget(.wgmma_mma_async);
         validate(.wgmma_mma_async, d_ty);
         const dst = self.tmp(d_ty);
         self.line(std.fmt.comptimePrint("wgmma.mma_async.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
@@ -2145,6 +2285,7 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("prefetchu{s} [{s}];", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
+        validateStateSpace(.isspacep, space, PtxType.pred);
         const dst = self.tmp(PtxType.pred);
         self.line(std.fmt.comptimePrint("isspacep{s} {s}, {s};", .{ space.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
@@ -2155,9 +2296,11 @@ pub const KernelBuilder = struct {
         return dst;
     }
     pub fn cp_async_bulk(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype, flag: anytype) void {
+        self.validateTarget(.cp_async_bulk);
         self.line(std.fmt.comptimePrint("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag [{s}], [{s}], {s}, [{s}];", .{ fmtOp(dst), fmtOp(src), fmtOp(size), fmtOp(flag) }));
     }
     pub fn mbarrier(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype) void {
+        self.validateTarget(.mbarrier);
         self.line(std.fmt.comptimePrint("mbarrier{s}.shared.b64 [{s}];", .{ op.suffix(), fmtOp(addr_op) }));
     }
 
@@ -2176,6 +2319,7 @@ pub const KernelBuilder = struct {
         res = res ++ ".entry " ++ self.name ++ "(\n";
         if (self.params_text.len > 0) res = res ++ self.params_text ++ "\n";
         res = res ++ ") {\n";
+        if (self.shared_decls.len > 0) res = res ++ self.shared_decls;
         inline for (std.meta.fields(@TypeOf(self.counts))) |field| {
             const count = @field(self.counts, field.name);
             if (count > 0) {
@@ -2206,6 +2350,7 @@ pub const ModuleOptions = struct {
     version: Version = .v8_4,
     target: Target = .sm_75,
     address_size: u32 = 64,
+    max_virtual_registers_per_kernel: ?u32 = null,
 };
 
 pub const Module = struct {
@@ -2215,7 +2360,11 @@ pub const Module = struct {
 
     pub fn entry(comptime self: *Module, comptime name: []const u8, comptime ps: anytype) *KernelBuilder {
         const k = &self.kernels[self.kernel_count];
-        k.* = .{ .name = name };
+        k.* = .{
+            .name = name,
+            .target = self.options.target,
+            .max_virtual_registers = self.options.max_virtual_registers_per_kernel,
+        };
         _ = k.params(ps);
         self.kernel_count += 1;
         return k;
@@ -2321,4 +2470,65 @@ test "tuple params verification" {
     });
     try std.testing.expect(std.mem.indexOf(u8, result, ".param .b64 p0") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 p1") != null);
+}
+
+test "shared memory declarations verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn test_shared(k: *ptx.KernelBuilder) void {
+            const scratch = k.allocShared(PtxType.b32, "scratch", 256, 16);
+            const r0 = k.tmp(PtxType.b32);
+            k.st(.shared, PtxType.b32, scratch, r0);
+            _ = k.ld(.shared, PtxType.b32, scratch);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".shared .align 16 .b32 scratch[256];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.shared.b32 [scratch]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.shared.b32") != null);
+}
+
+test "target propagated into kernel builder verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{ .target = .sm_80 }, struct {
+        pub fn async_copy(k: *ptx.KernelBuilder) void {
+            const dst = k.allocShared(PtxType.b8, "dst", 16, 16);
+            const src = k.tmp(PtxType.b64);
+            k.cp_async(dst, src, 16);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".target sm_80") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "cp.async.ca.shared.global [dst]") != null);
+}
+
+test "register limit tracking verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{ .max_virtual_registers_per_kernel = 4 }, struct {
+        pub fn reg_budget(k: *ptx.KernelBuilder) void {
+            _ = k.tmp(PtxType.u32);
+            _ = k.tmp(PtxType.u32);
+            _ = k.tmp(PtxType.pred);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".reg .pred %p<1>;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".reg .b32 %r<2>;") != null);
+}
+
+test "shared handle offset formatting verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn shared_offset(k: *ptx.KernelBuilder) void {
+            const scratch = k.allocShared(PtxType.b32, "scratch", 8, 16);
+            const r0 = k.tmp(PtxType.b32);
+            k.st(.shared, PtxType.b32, ptx.Shared(PtxType.b32){ .name = scratch.name, .offset = 4 }, r0);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.shared.b32 [scratch+4]") != null);
 }

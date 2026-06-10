@@ -29,7 +29,7 @@ pub fn main() !void {
             k.retIf(p0);
 
             // Calculate address: A + tid * 4 (for float32)
-            const tid64 = k.cvt(.u64, .u32, global_tid);
+            const tid64 = k.cvt(.u64, .u32, global_tid, .none);
             const offset = k.mul(.u64, tid64, @as(u64, 4));
 
             const addrA = k.add(.u64, k.ldParam(ps.A), offset);
