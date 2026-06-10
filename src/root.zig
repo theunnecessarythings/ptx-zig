@@ -359,6 +359,50 @@ pub const MbarrierOp = enum {
     }
 };
 
+pub const MmaShape = enum {
+    m16n8k8,
+    m16n8k16,
+    m16n8k32,
+    m64n128k16,
+    m64n64k16,
+    m8n8k4,
+    pub fn suffix(self: MmaShape) []const u8 {
+        return "." ++ @tagName(self);
+    }
+};
+
+pub const MmaLayout = enum {
+    row,
+    col,
+    pub fn suffix(self: MmaLayout) []const u8 {
+        return "." ++ @tagName(self);
+    }
+};
+
+pub const CacheLevel = enum {
+    L1,
+    L2,
+    pub fn suffix(self: CacheLevel) []const u8 {
+        return "." ++ @tagName(self);
+    }
+};
+
+pub const CvtDirection = enum {
+    to,
+    from,
+    pub fn suffix(self: CvtDirection) []const u8 {
+        return "." ++ @tagName(self);
+    }
+};
+
+pub const BarrierOp = enum {
+    arrive,
+    wait,
+    pub fn suffix(self: BarrierOp) []const u8 {
+        return "." ++ @tagName(self);
+    }
+};
+
 pub const StateSpace = enum {
     reg,
     sreg,
@@ -417,6 +461,26 @@ pub const Version = struct {
     pub const v9_0 = Version{ .major = 9, .minor = 0 };
     pub const v9_3 = Version{ .major = 9, .minor = 3 };
 };
+
+pub const ParamHandle = struct {
+    name: []const u8,
+    ty: PtxType,
+};
+
+pub fn ParamsResult(comptime T: type) type {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or info.@"struct".is_tuple) return void;
+    const fields = info.@"struct".fields;
+    var field_names: [fields.len][:0]const u8 = undefined;
+    var field_types: [fields.len]type = undefined;
+    var field_attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    inline for (fields, 0..) |field, i| {
+        field_names[i] = field.name;
+        field_types[i] = ParamHandle;
+        field_attrs[i] = .{};
+    }
+    return @Struct(.auto, null, &field_names, &field_types, &field_attrs);
+}
 
 pub fn Reg(comptime ty_: PtxType) type {
     return struct {
@@ -521,7 +585,7 @@ pub const Opcode = enum {
     mul,
     mul24,
     neg,
-    @"not",
+    not,
     @"or",
     pmevent,
     popc,
@@ -590,7 +654,7 @@ pub const Opcode = enum {
     vsub2,
     vsub4,
     wgmma_mma_async,
-    @"xor",
+    xor,
 };
 
 pub const Modifier = enum {
@@ -720,7 +784,7 @@ pub const Modifier = enum {
     width,
     wrap,
     wt,
-    @"xor",
+    xor,
     zero,
 };
 
@@ -921,7 +985,7 @@ pub fn isValid(comptime op: Opcode, comptime ty: ScalarType) bool {
             .bf16, .bf16x2, .f16, .f16x2, .f32, .f64, .s16, .s32, .s64 => true,
             else => false,
         },
-        .@"not" => switch (ty) {
+        .not => switch (ty) {
             .b16, .b32, .b64, .pred => true,
             else => false,
         },
@@ -1185,7 +1249,7 @@ pub fn isValid(comptime op: Opcode, comptime ty: ScalarType) bool {
             .bf16, .f16, .f32, .s8, .tf32, .u8 => true,
             else => false,
         },
-        .@"xor" => switch (ty) {
+        .xor => switch (ty) {
             .b16, .b32, .b64, .pred => true,
             else => false,
         },
@@ -1209,6 +1273,9 @@ fn fmtOp(comptime op: anytype) []const u8 {
             }
         },
         .@"struct" => {
+            if (T == ParamHandle) {
+                return std.fmt.comptimePrint("%{s}", .{op.name});
+            }
             if (@hasDecl(T, "ty") and @hasField(T, "data")) {
                 switch (op.data) {
                     .id => |id| {
@@ -1284,10 +1351,30 @@ pub const KernelBuilder = struct {
     } = .{},
     body: []const u8 = "",
 
-    pub fn params(comptime self: *KernelBuilder, comptime ps: anytype) void {
-        inline for (ps, 0..) |p, i| {
-            if (i > 0 or self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
-            self.params_text = self.params_text ++ "\t.param " ++ p;
+    pub fn params(comptime self: *KernelBuilder, comptime ps: anytype) ParamsResult(@TypeOf(ps)) {
+        const T = @TypeOf(ps);
+        const info = @typeInfo(T);
+        if (info.@"struct".is_tuple) {
+            inline for (ps, 0..) |p, i| {
+                if (i > 0 or self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
+                self.params_text = self.params_text ++ "\t.param " ++ p;
+            }
+            return {};
+        } else {
+            var res: ParamsResult(T) = undefined;
+            inline for (info.@"struct".fields) |field| {
+                const val = @field(ps, field.name);
+                const ty: PtxType = blk: {
+                    if (@TypeOf(val) == PtxType) break :blk val;
+                    if (@TypeOf(val) == ScalarType) break :blk PtxType{ .scalar = val };
+                    if (@typeInfo(@TypeOf(val)) == .enum_literal) break :blk PtxType{ .scalar = @field(ScalarType, @tagName(val)) };
+                    @compileError("Invalid parameter type for " ++ field.name);
+                };
+                if (self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
+                self.params_text = self.params_text ++ std.fmt.comptimePrint("\t.param {s} {s}", .{ ty.suffix(), field.name });
+                @field(res, field.name) = .{ .name = field.name, .ty = ty };
+            }
+            return res;
         }
     }
 
@@ -1651,10 +1738,10 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("cvt{s}{s} {s}, {s};", .{ dst_ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn cvta(comptime self: *KernelBuilder, comptime to_from: enum { to, from }, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
+    pub fn cvta(comptime self: *KernelBuilder, comptime dir: CvtDirection, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
         validate(.cvta, ty);
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("cvta.{s}{s}{s} {s}, {s};", .{ @tagName(to_from), space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        self.line(std.fmt.comptimePrint("cvta{s}{s}{s} {s}, {s};", .{ dir.suffix(), space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn ld(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
@@ -1667,12 +1754,12 @@ pub const KernelBuilder = struct {
         validate(.st, ty);
         self.line(std.fmt.comptimePrint("st{s}{s} [{s}], {s};", .{ space.suffix(), ty.suffix(), fmtOp(a), fmtOp(b) }));
     }
-    pub fn ldParam(comptime self: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8) Reg(ty) {
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("ld.param{s} {s}, [%{s}];", .{ ty.suffix(), fmtOp(dst), name }));
+    pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
+        const dst = self.tmp(p.ty);
+        self.line(std.fmt.comptimePrint("ld.param{s} {s}, [{s}];", .{ p.ty.suffix(), fmtOp(dst), fmtOp(p) }));
         return dst;
     }
-    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, comptime name: []const u8, val: anytype) void {
+    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, name: []const u8, val: anytype) void {
         self.line(std.fmt.comptimePrint("st.global{s} [%{s}], {s};", .{ ty.suffix(), name, fmtOp(val) }));
     }
     pub fn ret(comptime self: *KernelBuilder) void {
@@ -1693,8 +1780,8 @@ pub const KernelBuilder = struct {
     pub fn bar_sync(comptime self: *KernelBuilder, a: anytype) void {
         self.line(std.fmt.comptimePrint("bar.sync {s};", .{fmtOp(a)}));
     }
-    pub fn barrier(comptime self: *KernelBuilder, comptime op: []const u8) void {
-        self.line("barrier." ++ op ++ ";");
+    pub fn barrier(comptime self: *KernelBuilder, comptime op: BarrierOp) void {
+        self.line(std.fmt.comptimePrint("barrier.cluster{s};", .{op.suffix()}));
     }
     pub fn grpbarrier(comptime self: *KernelBuilder) void {
         self.line("grpbarrier.cluster;");
@@ -1973,16 +2060,16 @@ pub const KernelBuilder = struct {
     pub fn tcgen05(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype, size: anytype) void {
         self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 [{s}], {s};", .{ op.suffix(), fmtOp(addr_op), fmtOp(size) }));
     }
-    pub fn mma(comptime self: *KernelBuilder, comptime sync: []const u8, comptime aligned: []const u8, comptime shape: []const u8, comptime layout: []const u8, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
+    pub fn mma(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
         validate(.mma, d_ty);
         const dst = self.tmp(d_ty);
-        self.line(std.fmt.comptimePrint("mma.{s}.{s}.{s}.{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ sync, aligned, shape, layout, d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        self.line(std.fmt.comptimePrint("mma.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
-    pub fn wgmma_mma_async(comptime self: *KernelBuilder, comptime sync: []const u8, comptime aligned: []const u8, comptime shape: []const u8, comptime layout: []const u8, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
+    pub fn wgmma_mma_async(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
         validate(.wgmma_mma_async, d_ty);
         const dst = self.tmp(d_ty);
-        self.line(std.fmt.comptimePrint("wgmma.mma_async.{s}.{s}.{s}.{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ sync, aligned, shape, layout, d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        self.line(std.fmt.comptimePrint("wgmma.mma_async.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
     pub fn pmevent(comptime self: *KernelBuilder, a: anytype) void {
@@ -1995,11 +2082,11 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("ldu.global{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(addr_op) }));
         return dst;
     }
-    pub fn prefetch(comptime self: *KernelBuilder, comptime level: []const u8, addr_op: anytype) void {
-        self.line(std.fmt.comptimePrint("prefetch.global.{s} {s};", .{ level, fmtOp(addr_op) }));
+    pub fn prefetch(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
+        self.line(std.fmt.comptimePrint("prefetch.global{s} {s};", .{ level.suffix(), fmtOp(addr_op) }));
     }
-    pub fn prefetchu(comptime self: *KernelBuilder, comptime level: []const u8, addr_op: anytype) void {
-        self.line(std.fmt.comptimePrint("prefetchu.{s} {s};", .{ level, fmtOp(addr_op) }));
+    pub fn prefetchu(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
+        self.line(std.fmt.comptimePrint("prefetchu{s} {s};", .{ level.suffix(), fmtOp(addr_op) }));
     }
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
         const dst = self.tmp(PtxType.pred);
@@ -2104,9 +2191,13 @@ test "unified library verification" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
         pub fn vector_add(k: *ptx.KernelBuilder) void {
-            k.params(.{ ".b64 A", ".b64 B", ".b64 C" });
-            const rA = k.ldParam(PtxType.b64, "A");
-            const rB = k.ldParam(PtxType.b64, "B");
+            const ps = k.params(.{
+                .A = .b64,
+                .B = .b64,
+                .C = .b64,
+            });
+            const rA = k.ldParam(ps.A);
+            const rB = k.ldParam(ps.B);
             const rC = k.add(PtxType.f32, rA, rB);
             k.stGlobal(PtxType.b64, "C", rC);
             k.ret();
