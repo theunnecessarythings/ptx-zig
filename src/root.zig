@@ -124,8 +124,12 @@ pub const PtxType = struct {
     pub const b16 = PtxType{ .scalar = .b16 };
     pub const b32 = PtxType{ .scalar = .b32 };
     pub const b64 = PtxType{ .scalar = .b64 };
+    pub const @"u8" = PtxType{ .scalar = .u8 };
+    pub const @"u16" = PtxType{ .scalar = .u16 };
     pub const @"u32" = PtxType{ .scalar = .u32 };
     pub const @"u64" = PtxType{ .scalar = .u64 };
+    pub const @"s8" = PtxType{ .scalar = .s8 };
+    pub const @"s16" = PtxType{ .scalar = .s16 };
     pub const s32 = PtxType{ .scalar = .s32 };
     pub const s64 = PtxType{ .scalar = .s64 };
     pub const @"f16" = PtxType{ .scalar = .f16 };
@@ -495,6 +499,7 @@ pub const Version = struct {
     pub const v8_4 = Version{ .major = 8, .minor = 4 };
     pub const v8_5 = Version{ .major = 8, .minor = 5 };
     pub const v9_0 = Version{ .major = 9, .minor = 0 };
+    pub const v9_1 = Version{ .major = 9, .minor = 1 };
     pub const v9_3 = Version{ .major = 9, .minor = 3 };
 
     pub fn supportsAtLeast(self: Version, comptime major: u32, comptime minor: u32) bool {
@@ -521,6 +526,15 @@ pub const EntryVisibility = enum {
 pub const ParamHandle = struct {
     name: []const u8,
     ty: PtxType,
+    offset: i32 = 0,
+
+    pub fn at(comptime self: ParamHandle, comptime byte_offset: i32) ParamHandle {
+        return .{
+            .name = self.name,
+            .ty = self.ty,
+            .offset = self.offset + byte_offset,
+        };
+    }
 };
 
 pub const CallableKind = enum {
@@ -1373,7 +1387,13 @@ fn fmtOp(comptime op: anytype) []const u8 {
         },
         .@"struct" => {
             if (T == ParamHandle) {
-                return std.fmt.comptimePrint("{s}", .{op.name});
+                if (op.offset == 0) {
+                    return std.fmt.comptimePrint("{s}", .{op.name});
+                } else if (op.offset > 0) {
+                    return std.fmt.comptimePrint("{s}+{d}", .{ op.name, op.offset });
+                } else {
+                    return std.fmt.comptimePrint("{s}{d}", .{ op.name, op.offset });
+                }
             }
             if (@hasDecl(T, "space") and @hasDecl(T, "ty") and @hasField(T, "name")) {
                 switch (T.space) {
@@ -1867,6 +1887,34 @@ pub const KernelBuilder = struct {
             }
             return res;
         }
+    }
+
+    pub fn paramArray(
+        comptime self: *KernelBuilder,
+        comptime ty: PtxType,
+        comptime name: []const u8,
+        comptime len: u32,
+        comptime alignment: u32,
+    ) ParamHandle {
+        validateMemoryDeclaration("parameter", ty, len, alignment);
+        if (self.params_text.len > 0) self.params_text = self.params_text ++ ",\n";
+        self.params_text = self.params_text ++ std.fmt.comptimePrint(
+            "\t.param .align {d} {s} {s}[{d}]",
+            .{ alignment, ty.suffix(), name, len },
+        );
+        self.param_types[self.param_count] = ty;
+        self.param_names[self.param_count] = name;
+        self.param_count += 1;
+        return .{ .name = name, .ty = ty };
+    }
+
+    pub fn paramBytes(
+        comptime self: *KernelBuilder,
+        comptime name: []const u8,
+        comptime len: u32,
+        comptime alignment: u32,
+    ) ParamHandle {
+        return self.paramArray(PtxType.b8, name, len, alignment);
     }
 
     pub fn raw(comptime self: *KernelBuilder, comptime s: []const u8) void {
@@ -2987,6 +3035,7 @@ pub const Module = struct {
     kernels: [256]KernelBuilder = undefined,
     functions: [256]KernelBuilder = undefined,
     function_count: usize = 0,
+    extern_shared_decls: []const u8 = "",
     const_decls: []const u8 = "",
     global_decls: []const u8 = "",
     kernel_count: usize = 0,
@@ -3012,6 +3061,21 @@ pub const Module = struct {
     ) Global(ty) {
         validateMemoryDeclaration("global", ty, len, alignment);
         self.global_decls = self.global_decls ++ memoryDeclarationLine(.global, ty, name, len, alignment);
+        return .{ .name = name };
+    }
+
+    pub fn externShared(
+        comptime self: *Module,
+        comptime name: []const u8,
+        comptime alignment: u32,
+    ) Shared(PtxType.b8) {
+        if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
+            @compileError("extern shared alignment must be a non-zero power of two");
+        }
+        self.extern_shared_decls = self.extern_shared_decls ++ std.fmt.comptimePrint(
+            ".extern .shared .align {d} .b8 {s}[];\n",
+            .{ alignment, name },
+        );
         return .{ .name = name };
     }
 
@@ -3067,9 +3131,10 @@ pub const Module = struct {
         res = res ++ std.fmt.comptimePrint(".version {d}.{d}\n", .{ self.options.version.major, self.options.version.minor });
         res = res ++ ".target " ++ @tagName(self.options.target) ++ "\n";
         res = res ++ std.fmt.comptimePrint(".address_size {d}\n\n", .{self.options.address_size});
+        if (self.extern_shared_decls.len > 0) res = res ++ self.extern_shared_decls;
         if (self.const_decls.len > 0) res = res ++ self.const_decls;
         if (self.global_decls.len > 0) res = res ++ self.global_decls;
-        if (self.const_decls.len > 0 or self.global_decls.len > 0) {
+        if (self.extern_shared_decls.len > 0 or self.const_decls.len > 0 or self.global_decls.len > 0) {
             res = res ++ "\n";
         }
         inline for (self.functions[0..self.function_count]) |*f| res = res ++ f.generate() ++ "\n";
@@ -3935,6 +4000,40 @@ test "entry named argument loading helper verification" {
     try std.testing.expect(std.mem.indexOf(u8, result, ".param .u32 N") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.b64 %rd0, [A];") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [N];") != null);
+}
+
+test "dynamic shared memory verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            _ = m.externShared("dynamic_scratch", 1024);
+            const k = m.entry("use_dynamic", .{});
+            k.raw("\tmov.u32 %r0, dynamic_scratch;\n");
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".extern .shared .align 1024 .b8 dynamic_scratch[];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "mov.u32 %r0, dynamic_scratch;") != null);
+}
+
+test "parameter array verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const k = m.entry("array_params", .{});
+            const bytes = k.paramBytes("buffer", 64, 64);
+            const ints = k.paramArray(PtxType.u32, "table", 8, 4);
+            _ = k.ld(.param, PtxType.u32, ints.at(4));
+            _ = k.ld(.param, PtxType.b8, bytes.at(7));
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .align 64 .b8 buffer[64]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".param .align 4 .u32 table[8]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.u32 %r0, [table+4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.param.b8 %b0, [buffer+7]") != null);
 }
 
 test "compile-fail validation rejects missing named parameter" {
