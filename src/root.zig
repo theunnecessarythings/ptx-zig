@@ -561,6 +561,24 @@ pub fn Shared(comptime ty_: PtxType) type {
     };
 }
 
+pub fn Global(comptime ty_: PtxType) type {
+    return struct {
+        pub const space = StateSpace.global;
+        pub const ty = ty_;
+        name: []const u8,
+        offset: i32 = 0,
+    };
+}
+
+pub fn Const(comptime ty_: PtxType) type {
+    return struct {
+        pub const space = StateSpace.const_space;
+        pub const ty = ty_;
+        name: []const u8,
+        offset: i32 = 0,
+    };
+}
+
 pub const sreg = struct {
     pub const tid = struct {
         pub const x = "%tid.x";
@@ -1337,14 +1355,17 @@ fn fmtOp(comptime op: anytype) []const u8 {
                 return std.fmt.comptimePrint("{s}", .{op.name});
             }
             if (@hasDecl(T, "space") and @hasDecl(T, "ty") and @hasField(T, "name")) {
-                if (T.space == .shared) {
-                    if (op.offset == 0) {
-                        return std.fmt.comptimePrint("{s}", .{op.name});
-                    } else if (op.offset > 0) {
-                        return std.fmt.comptimePrint("{s}+{d}", .{ op.name, op.offset });
-                    } else {
-                        return std.fmt.comptimePrint("{s}{d}", .{ op.name, op.offset });
-                    }
+                switch (T.space) {
+                    .shared, .global, .const_space => {
+                        if (op.offset == 0) {
+                            return std.fmt.comptimePrint("{s}", .{op.name});
+                        } else if (op.offset > 0) {
+                            return std.fmt.comptimePrint("{s}+{d}", .{ op.name, op.offset });
+                        } else {
+                            return std.fmt.comptimePrint("{s}{d}", .{ op.name, op.offset });
+                        }
+                    },
+                    else => {},
                 }
             }
             if (@hasDecl(T, "ty") and @hasField(T, "data")) {
@@ -1616,6 +1637,22 @@ fn comptimeImmediateU32(comptime value: anytype) ?u32 {
     };
 }
 
+fn validateMemoryDeclaration(comptime label: []const u8, comptime ty: PtxType, comptime len: u32, comptime alignment: u32) void {
+    if (len == 0) {
+        @compileError(label ++ " memory allocation length must be greater than zero");
+    }
+    if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
+        @compileError(label ++ " memory alignment must be a non-zero power of two");
+    }
+    if (ty.scalar == .pred) {
+        @compileError("Cannot allocate .pred " ++ label ++ " memory");
+    }
+}
+
+fn memoryDeclarationLine(comptime space: StateSpace, comptime ty: PtxType, comptime name: []const u8, comptime len: u32, comptime alignment: u32) []const u8 {
+    return std.fmt.comptimePrint("\t{s} .align {d} {s} {s}[{d}];\n", .{ space.suffix(), alignment, ty.suffix(), name, len });
+}
+
 // --- Kernel Builder ---
 
 pub const KernelBuilder = struct {
@@ -1777,13 +1814,8 @@ pub const KernelBuilder = struct {
         comptime len: u32,
         comptime alignment: u32,
     ) Shared(ty) {
-        if (len == 0) @compileError("Shared memory allocation length must be greater than zero");
-        if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
-            @compileError("Shared memory alignment must be a non-zero power of two");
-        }
-        if (ty.scalar == .pred) @compileError("Cannot allocate .pred shared memory");
-
-        self.shared_decls = self.shared_decls ++ std.fmt.comptimePrint("\t.shared .align {d} {s} {s}[{d}];\n", .{ alignment, ty.suffix(), name, len });
+        validateMemoryDeclaration("shared", ty, len, alignment);
+        self.shared_decls = self.shared_decls ++ memoryDeclarationLine(.shared, ty, name, len, alignment);
         return .{ .name = name };
     }
 
@@ -2565,7 +2597,33 @@ pub const ModuleOptions = struct {
 pub const Module = struct {
     options: ModuleOptions,
     kernels: [256]KernelBuilder = undefined,
+    const_decls: []const u8 = "",
+    global_decls: []const u8 = "",
     kernel_count: usize = 0,
+
+    pub fn allocConst(
+        comptime self: *Module,
+        comptime ty: PtxType,
+        comptime name: []const u8,
+        comptime len: u32,
+        comptime alignment: u32,
+    ) Const(ty) {
+        validateMemoryDeclaration("const", ty, len, alignment);
+        self.const_decls = self.const_decls ++ memoryDeclarationLine(.const_space, ty, name, len, alignment);
+        return .{ .name = name };
+    }
+
+    pub fn allocGlobal(
+        comptime self: *Module,
+        comptime ty: PtxType,
+        comptime name: []const u8,
+        comptime len: u32,
+        comptime alignment: u32,
+    ) Global(ty) {
+        validateMemoryDeclaration("global", ty, len, alignment);
+        self.global_decls = self.global_decls ++ memoryDeclarationLine(.global, ty, name, len, alignment);
+        return .{ .name = name };
+    }
 
     pub fn entry(comptime self: *Module, comptime name: []const u8, comptime ps: anytype) *KernelBuilder {
         const k = &self.kernels[self.kernel_count];
@@ -2585,6 +2643,11 @@ pub const Module = struct {
         res = res ++ std.fmt.comptimePrint(".version {d}.{d}\n", .{ self.options.version.major, self.options.version.minor });
         res = res ++ ".target " ++ @tagName(self.options.target) ++ "\n";
         res = res ++ std.fmt.comptimePrint(".address_size {d}\n\n", .{self.options.address_size});
+        if (self.const_decls.len > 0) res = res ++ self.const_decls;
+        if (self.global_decls.len > 0) res = res ++ self.global_decls;
+        if (self.const_decls.len > 0 or self.global_decls.len > 0) {
+            res = res ++ "\n";
+        }
         inline for (self.kernels[0..self.kernel_count]) |*k| res = res ++ k.generate() ++ "\n";
         return res ++ "\x00";
     }
@@ -2667,6 +2730,76 @@ fn expectCompileFail(
         );
         return error.ExpectedCompileErrorSubstringNotFound;
     }
+}
+
+test "module const declaration verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const coeffs = m.allocConst(PtxType.b32, "coeffs", 64, 16);
+            const k = m.entry("use_const", .{});
+            _ = k.ld(.const_space, PtxType.b32, coeffs);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".const .align 16 .b32 coeffs[64];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.const.b32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[coeffs]") != null);
+}
+
+test "module global declaration verification" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const state = m.allocGlobal(PtxType.b32, "state", 1024, 16);
+            const k = m.entry("use_global", .{});
+            const r0 = k.tmp(PtxType.b32);
+            k.st(.global, PtxType.b32, state, r0);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, ".global .align 16 .b32 state[1024];") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.global.b32 [state]") != null);
+}
+
+test "module symbols can use offsets" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            const coeffs = m.allocConst(PtxType.b32, "coeffs", 64, 16);
+            const state = m.allocGlobal(PtxType.b32, "state", 1024, 16);
+            const k = m.entry("use_offsets", .{});
+            const c1 = ptx.Const(PtxType.b32){ .name = coeffs.name, .offset = 4 };
+            const s1 = ptx.Global(PtxType.b32){ .name = state.name, .offset = 8 };
+            const r0 = k.ld(.const_space, PtxType.b32, c1);
+            k.st(.global, PtxType.b32, s1, r0);
+            k.ret();
+        }
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "ld.const.b32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[coeffs+4]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "st.global.b32 [state+8]") != null);
+}
+
+test "module const and global declarations emit before entries" {
+    const ptx = @This();
+    const result = comptime ptx.build(.{}, struct {
+        pub fn emit(m: *ptx.Module) void {
+            _ = m.allocConst(PtxType.b16, "table", 8, 8);
+            _ = m.allocGlobal(PtxType.b64, "counter", 1, 8);
+            const k = m.entry("ordering", .{});
+            k.ret();
+        }
+    });
+
+    const const_pos = std.mem.indexOf(u8, result, ".const .align 8 .b16 table[8];").?;
+    const global_pos = std.mem.indexOf(u8, result, ".global .align 8 .b64 counter[1];").?;
+    const entry_pos = std.mem.indexOf(u8, result, ".entry ordering").?;
+    try std.testing.expect(const_pos < entry_pos);
+    try std.testing.expect(global_pos < entry_pos);
 }
 
 test "unified library verification" {
