@@ -91,6 +91,26 @@ pub const c = struct {
     pub const CU_FUNC_ATTRIBUTE_PTX_VERSION = 5;
     pub const CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6;
     pub const CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7;
+    pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 8;
+    pub const CU_JIT_INFO_LOG_BUFFER = 3;
+    pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4;
+    pub const CU_JIT_ERROR_LOG_BUFFER = 5;
+    pub const CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6;
+    pub const CU_JIT_LOG_VERBOSE = 12;
+
+    pub const CUtensorMap = extern struct {
+        data: [16]u64,
+    };
+    pub const CUtensorMapDataType = c_uint;
+    pub const CU_TENSOR_MAP_DATA_TYPE_FLOAT16 = 6;
+    pub const CUtensorMapInterleave = c_uint;
+    pub const CU_TENSOR_MAP_INTERLEAVE_NONE = 0;
+    pub const CUtensorMapSwizzle = c_uint;
+    pub const CU_TENSOR_MAP_SWIZZLE_128B = 3;
+    pub const CUtensorMapL2promotion = c_uint;
+    pub const CU_TENSOR_MAP_L2_PROMOTION_NONE = 0;
+    pub const CUtensorMapFloatOOBfill = c_uint;
+    pub const CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE = 0;
 };
 
 pub extern "c" fn cuGetErrorName(err: c.CUresult, msg: *[*:0]const u8) c.CUresult;
@@ -113,10 +133,33 @@ pub extern "c" fn cuEventDestroy(event: c.CUevent) c.CUresult;
 pub extern "c" fn cuEventRecord(event: c.CUevent, stream: ?c.CUstream) c.CUresult;
 pub extern "c" fn cuEventSynchronize(event: c.CUevent) c.CUresult;
 pub extern "c" fn cuEventElapsedTime(result: *f32, a: c.CUevent, b: c.CUevent) c.CUresult;
+pub extern "c" fn cuModuleLoadDataEx(
+    module: *c.CUmodule,
+    image: *const anyopaque,
+    numOptions: c_uint,
+    options: ?[*]c_uint,
+    optionValues: ?[*]*anyopaque,
+) c.CUresult;
+
 pub extern "c" fn cuModuleLoadData(module: *c.CUmodule, image: *const anyopaque) c.CUresult;
 pub extern "c" fn cuModuleUnload(module: c.CUmodule) c.CUresult;
 pub extern "c" fn cuModuleGetFunction(function: *c.CUfunction, module: c.CUmodule, name: [*:0]const u8) c.CUresult;
 pub extern "c" fn cuFuncGetAttribute(pi: *c_int, attrib: c.CUfunction_attribute, hfunc: c.CUfunction) c.CUresult;
+pub extern "c" fn cuFuncSetAttribute(hfunc: c.CUfunction, attrib: c.CUfunction_attribute, value: c_int) c.CUresult;
+pub extern "c" fn cuTensorMapEncodeTiled(
+    tensor_map: *c.CUtensorMap,
+    tensor_data_type: c.CUtensorMapDataType,
+    tensor_rank: c_uint,
+    global_address: *anyopaque,
+    global_dim: [*]const u64,
+    global_strides: [*]const u64,
+    box_dim: [*]const u32,
+    element_strides: [*]const u32,
+    interleave: c.CUtensorMapInterleave,
+    swizzle: c.CUtensorMapSwizzle,
+    l2_promotion: c.CUtensorMapL2promotion,
+    oob_fill: c.CUtensorMapFloatOOBfill,
+) c.CUresult;
 pub extern "c" fn cuLaunchKernel(
     function: c.CUfunction,
     gdx: c_uint,

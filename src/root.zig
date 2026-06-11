@@ -410,6 +410,7 @@ pub const CvtDirection = enum {
     to,
     from,
     pub fn suffix(self: CvtDirection) []const u8 {
+        if (self == .from) return "";
         return "." ++ @tagName(self);
     }
 };
@@ -667,6 +668,18 @@ pub fn BraceWrapper(comptime T: type) type {
 
 pub fn brace(val: anytype) BraceWrapper(@TypeOf(val)) {
     return .{ .val = val };
+}
+
+pub fn TensorMapCoordWrapper(comptime Tensor: type, comptime Coords: type) type {
+    return struct {
+        tensor: Tensor,
+        coords: Coords,
+        pub const is_tensor_map_coord = true;
+    };
+}
+
+pub fn tensorMapCoord(tensor: anytype, coords: anytype) TensorMapCoordWrapper(@TypeOf(tensor), @TypeOf(coords)) {
+    return .{ .tensor = tensor, .coords = coords };
 }
 
 pub const sreg = struct {
@@ -1217,7 +1230,7 @@ pub fn isValid(comptime op: Opcode, comptime ty: ScalarType) bool {
             else => false,
         },
         .setp => switch (ty) {
-            .f32, .f64, .s16, .s32, .s64, .u16, .u32, .u64 => true,
+            .b16, .b32, .b64, .f32, .f64, .s16, .s32, .s64, .u16, .u32, .u64 => true,
             else => false,
         },
         .shf => switch (ty) {
@@ -1441,6 +1454,9 @@ fn fmtOp(comptime op: anytype) []const u8 {
             }
         },
         .@"struct" => {
+            if (@hasDecl(T, "is_tensor_map_coord")) {
+                return std.fmt.comptimePrint("[{s}, {s}]", .{ fmtOp(op.tensor), fmtBraceList(op.coords) });
+            }
             if (@hasDecl(T, "is_addr_wrapper")) {
                 return fmtAddr(op.val);
             }
@@ -1486,7 +1502,11 @@ fn fmtOp(comptime op: anytype) []const u8 {
                             return res;
                         }
                     },
-                    .name => |name| return std.fmt.comptimePrint("%{s}", .{name}),
+                    .name => |name| {
+                        // PTX uses the bare underscore as a bit-bucket operand.
+                        if (std.mem.eql(u8, name, "_")) return "_";
+                        return std.fmt.comptimePrint("%{s}", .{name});
+                    },
                     .imm => |imm| {
                         return switch (imm) {
                             .u => |v| std.fmt.comptimePrint("{d}", .{v}),
@@ -2018,6 +2038,25 @@ pub const LdStBuilder = struct {
             return dst;
         }
     }
+
+    pub fn callInto(comptime self: @This(), dst: anytype, address: anytype) void {
+        if (self.op == .st) @compileError("callInto is only valid for load operations");
+        const t = self.ty_val.?;
+        const sp = self.space_val orelse if (self.op == .ldu) .global else @compileError("Space required for " ++ @tagName(self.op));
+        var s: []const u8 = @tagName(self.op) ++ sp.suffix();
+        if (self.volatile_val) s = s ++ ".volatile";
+        if (self.weak_val) s = s ++ ".weak";
+        if (self.order_val != .none) s = s ++ self.order_val.suffix();
+        if (self.scope_val != .none) s = s ++ self.scope_val.suffix();
+        s = s ++ t.suffix();
+        self.kb.validateForm(.{
+            .op = if (self.op == .ldu) .ldu else .ld,
+            .space = sp,
+            .ty = t,
+        });
+        validateMemoryAddressOperand(address, sp, t, "ld address");
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtAddr(address) ++ ";");
+    }
 };
 
 pub const AtomRedBuilder = struct {
@@ -2147,14 +2186,19 @@ pub const CvtBuilder = struct {
 
     pub fn call(comptime self: @This(), a: anytype) Reg(self.dst_ty_val.?) {
         const dt = self.dst_ty_val.?;
+        const dst_reg = self.kb.tmp(dt);
+        self.callInto(dst_reg, a);
+        return dst_reg;
+    }
+
+    pub fn callInto(comptime self: @This(), dst_op: anytype, src_op: anytype) void {
+        const dt = self.dst_ty_val.?;
         const st = self.src_ty_val.?;
         var s: []const u8 = "cvt";
         if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
         if (self.sat_val) s = s ++ ".sat";
         s = s ++ dt.suffix() ++ st.suffix();
-        const dst_reg = self.kb.tmp(dt);
-        self.kb.line(s ++ " " ++ fmtOp(dst_reg) ++ ", " ++ fmtOp(a) ++ ";");
-        return dst_reg;
+        self.kb.line(s ++ " " ++ fmtOp(dst_op) ++ ", " ++ fmtOp(src_op) ++ ";");
     }
 };
 
@@ -2264,6 +2308,26 @@ pub const MulMadBuilder = struct {
         self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
         return dst;
     }
+
+    pub fn callInto(comptime self: @This(), dst: anytype, args: anytype) void {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        var mode_str: []const u8 = "";
+        if (self.mode_val != .none) {
+            mode_str = "." ++ @tagName(self.mode_val);
+        } else {
+            switch (t.scalar) {
+                .f16, .f16x2, .f32, .f64, .bf16, .bf16x2 => {},
+                else => mode_str = ".lo",
+            }
+        }
+        s = s ++ mode_str;
+        if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
+        if (self.sat_val) s = s ++ ".sat";
+        s = s ++ t.suffix();
+        self.kb.validateForm(.{ .op = self.instruction, .ty = t });
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+    }
 };
 
 pub const ArithmeticBuilder = struct {
@@ -2315,6 +2379,16 @@ pub const ArithmeticBuilder = struct {
         const dst = self.kb.tmp(t);
         self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
         return dst;
+    }
+
+    pub fn callInto(comptime self: @This(), dst: anytype, args: anytype) void {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
+        if (self.sat_val) s = s ++ ".sat";
+        s = s ++ t.suffix();
+        self.kb.validateForm(.{ .op = self.instruction, .ty = t });
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
     }
 };
 
@@ -2396,7 +2470,9 @@ pub const SyncBuilder = struct {
 
     pub fn call(comptime self: @This(), args: anytype) if (self.ty_val) |t| Reg(t) else void {
         var s: []const u8 = @tagName(self.instruction);
-        if (std.mem.eql(u8, s, "shfl") or std.mem.eql(u8, s, "vote") or std.mem.eql(u8, s, "match")) {
+        if (std.mem.eql(u8, s, "shfl_sync")) {
+            s = "shfl.sync";
+        } else if (std.mem.eql(u8, s, "vote") or std.mem.eql(u8, s, "match")) {
             s = s ++ ".sync";
         }
         if (self.mode_val) |m| s = s ++ "." ++ m;
@@ -2410,14 +2486,32 @@ pub const SyncBuilder = struct {
             self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
         }
     }
+
+    pub fn callInto(comptime self: @This(), dst: anytype, args: anytype) void {
+        const t = self.ty_val orelse @compileError("callInto requires an instruction result type");
+        var s: []const u8 = @tagName(self.instruction);
+        if (std.mem.eql(u8, s, "shfl_sync")) {
+            s = "shfl.sync";
+        } else if (std.mem.eql(u8, s, "vote") or std.mem.eql(u8, s, "match")) {
+            s = s ++ ".sync";
+        }
+        if (self.mode_val) |m| s = s ++ "." ++ m;
+        s = s ++ t.suffix();
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+    }
 };
 
-pub const Tcgen05Op = enum { alloc, dealloc, mma, commit };
+pub const Tcgen05Op = enum { alloc, dealloc, mma, commit, ld, relinquish_alloc_permit };
 pub const Tcgen05Builder = struct {
     kb: *KernelBuilder,
     op: Tcgen05Op,
     cg_size: u32 = 1,
     kind_val: ?PtxType = null,
+    sync_val: bool = false,
+    aligned_val: bool = false,
+    shape_val: ?[]const u8 = null,
+    x_val: ?u32 = null,
+    ty_val: ?PtxType = null,
 
     pub fn cta_group(comptime self: @This(), comptime size: u32) @This() {
         var copy = self;
@@ -2425,18 +2519,56 @@ pub const Tcgen05Builder = struct {
         return copy;
     }
 
-    pub fn kind(comptime self: @This(), comptime ty: PtxType) @This() {
+    pub fn kind(comptime self: @This(), comptime t: PtxType) @This() {
         var copy = self;
-        copy.kind_val = ty;
+        copy.kind_val = t;
+        return copy;
+    }
+
+    pub fn sync(comptime self: @This()) @This() {
+        var copy = self;
+        copy.sync_val = true;
+        return copy;
+    }
+
+    pub fn aligned(comptime self: @This()) @This() {
+        var copy = self;
+        copy.aligned_val = true;
+        return copy;
+    }
+
+    pub fn shape(comptime self: @This(), comptime s: []const u8) @This() {
+        var copy = self;
+        copy.shape_val = s;
+        return copy;
+    }
+
+    pub fn x(comptime self: @This(), comptime n: u32) @This() {
+        var copy = self;
+        copy.x_val = n;
+        return copy;
+    }
+
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
         return copy;
     }
 
     pub fn call(comptime self: @This(), args: anytype) void {
         self.kb.validateTarget(.tcgen05);
-        var s: []const u8 = "tcgen05." ++ @tagName(self.op) ++ ".cta_group::" ++ std.fmt.comptimePrint("{d}", .{self.cg_size});
-        if (self.op == .alloc or self.op == .dealloc) {
-            s = s ++ ".sync.aligned";
+        var s: []const u8 = "tcgen05." ++ @tagName(self.op);
+        if (self.op != .ld) {
+            s = s ++ ".cta_group::" ++ std.fmt.comptimePrint("{d}", .{self.cg_size});
         }
+
+        if (self.sync_val or self.op == .alloc or self.op == .dealloc or self.op == .relinquish_alloc_permit) {
+            s = s ++ ".sync";
+        }
+        if (self.aligned_val or self.op == .alloc or self.op == .dealloc or self.op == .relinquish_alloc_permit) {
+            s = s ++ ".aligned";
+        }
+
         if (self.op == .commit) {
             s = s ++ ".mbarrier::arrive::one.shared::cluster.b64";
         } else if (self.op == .mma) {
@@ -2445,8 +2577,23 @@ pub const Tcgen05Builder = struct {
             s = s ++ ".shared::cta.b32";
         } else if (self.op == .dealloc) {
             s = s ++ ".b32";
+        } else if (self.op == .ld) {
+            if (self.shape_val) |sh| {
+                s = s ++ "." ++ sh;
+            }
+            if (self.x_val) |x_v| {
+                s = s ++ ".x" ++ std.fmt.comptimePrint("{d}", .{x_v});
+            }
+            if (self.ty_val) |t_v| {
+                s = s ++ t_v.suffix();
+            }
         }
-        self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+
+        if (operandCount(args) == 0) {
+            self.kb.line(s ++ ";");
+        } else {
+            self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+        }
     }
 };
 
@@ -2713,6 +2860,86 @@ pub const KernelBuilder = struct {
         self.body = self.body ++ s;
     }
 
+    /// Emits a pre-lowered PTX block after compile-time structural and target
+    /// validation. This is intended for incrementally importing compiler PTX
+    /// while instructions are promoted to specialized builders.
+    pub fn instructionBlock(comptime self: *KernelBuilder, comptime block: []const u8) void {
+        @setEvalBranchQuota(1000000);
+        comptime var lines = std.mem.splitScalar(u8, block, '\n');
+        inline while (lines.next()) |untrimmed| {
+            const source_line = std.mem.trim(u8, untrimmed, " \t\r");
+            if (source_line.len == 0 or std.mem.startsWith(u8, source_line, "//")) continue;
+            if (std.mem.startsWith(u8, source_line, ".reg ") or
+                std.mem.startsWith(u8, source_line, ".pragma ") or
+                std.mem.eql(u8, source_line, "{") or
+                std.mem.eql(u8, source_line, "}"))
+            {
+                self.raw("\t" ++ source_line ++ "\n");
+                continue;
+            }
+            if (source_line[source_line.len - 1] == ':') {
+                self.raw(source_line ++ "\n");
+                continue;
+            }
+
+            const instruction = if (source_line[0] == '@')
+                std.mem.trimStart(u8, source_line[(std.mem.indexOfScalar(u8, source_line, ' ') orelse
+                    @compileError("malformed predicated PTX instruction")) + 1 ..], " \t")
+            else
+                source_line;
+            if (instruction[instruction.len - 1] != ';')
+                @compileError("PTX instruction must end in ';': " ++ source_line);
+
+            const mnemonic_end = std.mem.indexOfAny(u8, instruction, " \t;") orelse
+                @compileError("malformed PTX instruction: " ++ source_line);
+            const mnemonic = instruction[0..mnemonic_end];
+            const known = std.mem.startsWith(u8, mnemonic, "add.") or
+                std.mem.startsWith(u8, mnemonic, "and.") or
+                std.mem.startsWith(u8, mnemonic, "bar.") or
+                std.mem.eql(u8, mnemonic, "bra") or
+                std.mem.eql(u8, mnemonic, "bra.uni") or
+                std.mem.startsWith(u8, mnemonic, "cp.async.") or
+                std.mem.startsWith(u8, mnemonic, "cvt.") or
+                std.mem.startsWith(u8, mnemonic, "elect.") or
+                std.mem.startsWith(u8, mnemonic, "fence.") or
+                std.mem.startsWith(u8, mnemonic, "ld.") or
+                std.mem.startsWith(u8, mnemonic, "mad.") or
+                std.mem.startsWith(u8, mnemonic, "mbarrier.") or
+                std.mem.startsWith(u8, mnemonic, "max.") or
+                std.mem.startsWith(u8, mnemonic, "min.") or
+                std.mem.startsWith(u8, mnemonic, "mov.") or
+                std.mem.startsWith(u8, mnemonic, "mul.") or
+                std.mem.startsWith(u8, mnemonic, "neg.") or
+                std.mem.startsWith(u8, mnemonic, "not.") or
+                std.mem.startsWith(u8, mnemonic, "or.") or
+                std.mem.eql(u8, mnemonic, "ret") or
+                std.mem.startsWith(u8, mnemonic, "selp.") or
+                std.mem.startsWith(u8, mnemonic, "setp.") or
+                std.mem.startsWith(u8, mnemonic, "shl.") or
+                std.mem.startsWith(u8, mnemonic, "shr.") or
+                std.mem.startsWith(u8, mnemonic, "st.") or
+                std.mem.startsWith(u8, mnemonic, "sub.") or
+                std.mem.startsWith(u8, mnemonic, "tcgen05.") or
+                std.mem.startsWith(u8, mnemonic, "xor.");
+            if (!known) @compileError("unsupported PTX opcode in instructionBlock: " ++ mnemonic);
+
+            if ((std.mem.startsWith(u8, instruction, "tcgen05.") or
+                std.mem.startsWith(u8, instruction, "elect.")) and self.target != .sm_100a)
+            {
+                @compileError("Blackwell instruction requires sm_100a: " ++ source_line);
+            }
+            if (std.mem.startsWith(u8, instruction, "cp.async.bulk.tensor.") and
+                !self.target.supportsAtLeast(9, 0))
+            {
+                @compileError("tensor bulk copy requires sm_90 or newer: " ++ source_line);
+            }
+            if (std.mem.indexOf(u8, instruction, "%_") != null)
+                @compileError("invalid PTX bit-bucket register '%_'; use '_'");
+
+            self.raw("\t" ++ source_line ++ "\n");
+        }
+    }
+
     pub fn line(comptime self: *KernelBuilder, comptime s: []const u8) void {
         if (self.active_predicate) |p| {
             if (s[0] == '@') {
@@ -2972,6 +3199,10 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("add{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
+    pub fn addInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, a: anytype, b: anytype) void {
+        self.validateForm(.{ .op = .add, .ty = ty });
+        self.line(std.fmt.comptimePrint("add{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+    }
     pub fn addc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         self.validateForm(.{ .op = .addc, .ty = ty });
         const dst = self.tmp(ty);
@@ -2983,6 +3214,10 @@ pub const KernelBuilder = struct {
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("and{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
+    }
+    pub fn andInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, a: anytype, b: anytype) void {
+        self.validateForm(.{ .op = .@"and", .ty = ty });
+        self.line(std.fmt.comptimePrint("and{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
     }
     pub fn bfind(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
         self.validateForm(.{ .op = .bfind, .ty = ty });
@@ -3190,6 +3425,10 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("min{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
+    pub fn minInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, a: anytype, b: anytype) void {
+        self.validateForm(.{ .op = .min, .ty = ty });
+        self.line(std.fmt.comptimePrint("min{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+    }
 
     pub fn mov(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
         self.validateForm(.{ .op = .mov, .ty = ty });
@@ -3228,6 +3467,10 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("selp{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+    pub fn selpInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, a: anytype, b: anytype, c: anytype) void {
+        self.validateForm(.{ .op = .selp, .ty = ty });
+        self.line(std.fmt.comptimePrint("selp{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+    }
 
     pub fn set(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, comptime src_ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         self.validateForm(.{ .op = .set, .ty = src_ty });
@@ -3241,6 +3484,10 @@ pub const KernelBuilder = struct {
         const dst = self.tmp(PtxType.pred);
         self.line(std.fmt.comptimePrint("setp{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
+    }
+    pub fn setpInto(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, dst: anytype, a: anytype, b: anytype) void {
+        self.validateForm(.{ .op = .setp, .ty = ty });
+        self.line(std.fmt.comptimePrint("setp{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
     }
 
     pub fn shf(comptime self: *KernelBuilder, comptime dir: Direction, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
@@ -3288,6 +3535,15 @@ pub const KernelBuilder = struct {
 
     pub fn label(comptime self: *KernelBuilder, comptime name: []const u8) void {
         self.raw(name ++ ":\n");
+    }
+    pub fn beginScope(comptime self: *KernelBuilder) void {
+        self.raw("\t{\n");
+    }
+    pub fn endScope(comptime self: *KernelBuilder) void {
+        self.raw("\t}\n");
+    }
+    pub fn pragma(comptime self: *KernelBuilder, comptime value: []const u8) void {
+        self.line(".pragma \"" ++ value ++ "\";");
     }
 
     pub fn cvt(comptime self: *KernelBuilder) CvtBuilder {
@@ -3354,6 +3610,9 @@ pub const KernelBuilder = struct {
     pub fn bar_sync(comptime self: *KernelBuilder, a: anytype) void {
         self.line(std.fmt.comptimePrint("bar.sync {s};", .{fmtOp(a)}));
     }
+    pub fn barSyncCount(comptime self: *KernelBuilder, barrier_id: anytype, count: anytype) void {
+        self.line(std.fmt.comptimePrint("bar.sync {s}, {s};", .{ fmtOp(barrier_id), fmtOp(count) }));
+    }
 
     pub fn bar(comptime self: *KernelBuilder, id: anytype, n: anytype) void {
         self.line(std.fmt.comptimePrint("bar.sync {s}, {s};", .{ fmtOp(id), fmtOp(n) }));
@@ -3385,9 +3644,15 @@ pub const KernelBuilder = struct {
     pub fn bra(comptime self: *KernelBuilder, comptime target: []const u8) void {
         self.line("bra " ++ target ++ ";");
     }
+    pub fn braUni(comptime self: *KernelBuilder, comptime target: []const u8) void {
+        self.line("bra.uni " ++ target ++ ";");
+    }
 
     pub fn braIf(comptime self: *KernelBuilder, p: anytype, comptime is_neg: bool, comptime target: []const u8) void {
         self.line((if (is_neg) "@!" else "@") ++ fmtOp(p) ++ " bra " ++ target ++ ";");
+    }
+    pub fn braIfUni(comptime self: *KernelBuilder, p: anytype, comptime is_neg: bool, comptime target: []const u8) void {
+        self.line((if (is_neg) "@!" else "@") ++ fmtOp(p) ++ " bra.uni " ++ target ++ ";");
     }
 
     pub fn movInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, src: anytype) void {
@@ -3482,13 +3747,13 @@ pub const KernelBuilder = struct {
     }
 
     pub fn vote(comptime self: *KernelBuilder, comptime m: VoteMode) SyncBuilder {
-        return .{ .kb = self, .instruction = .vote }.mode(m);
+        return (SyncBuilder{ .kb = self, .instruction = .vote }).mode(m);
     }
     pub fn match(comptime self: *KernelBuilder, comptime m: enum { any, all }) SyncBuilder {
-        return .{ .kb = self, .instruction = .match }.mode(m);
+        return (SyncBuilder{ .kb = self, .instruction = .match }).mode(m);
     }
     pub fn shfl(comptime self: *KernelBuilder, comptime m: ShflMode) SyncBuilder {
-        return .{ .kb = self, .instruction = .shfl }.mode(m);
+        return (SyncBuilder{ .kb = self, .instruction = .shfl_sync }).mode(m);
     }
 
     pub fn prmt(comptime self: *KernelBuilder, comptime mode: PrmtMode, a: anytype, b: anytype, c: anytype) Reg(PtxType.b32) {
