@@ -128,8 +128,8 @@ pub const PtxType = struct {
     pub const @"u16" = PtxType{ .scalar = .u16 };
     pub const @"u32" = PtxType{ .scalar = .u32 };
     pub const @"u64" = PtxType{ .scalar = .u64 };
-    pub const @"s8" = PtxType{ .scalar = .s8 };
-    pub const @"s16" = PtxType{ .scalar = .s16 };
+    pub const s8 = PtxType{ .scalar = .s8 };
+    pub const s16 = PtxType{ .scalar = .s16 };
     pub const s32 = PtxType{ .scalar = .s32 };
     pub const s64 = PtxType{ .scalar = .s64 };
     pub const @"f16" = PtxType{ .scalar = .f16 };
@@ -201,6 +201,16 @@ pub const MemOrder = enum {
     acq_rel,
     pub fn suffix(self: MemOrder) []const u8 {
         if (self == .none) return "";
+        return "." ++ @tagName(self);
+    }
+};
+
+pub const FenceOp = enum {
+    sc,
+    mbarrier_init,
+    proxy_alias,
+
+    pub fn suffix(self: FenceOp) []const u8 {
         return "." ++ @tagName(self);
     }
 };
@@ -359,7 +369,9 @@ pub const SurfQuery = enum {
 pub const MbarrierOp = enum {
     init,
     arrive,
+    arrive_drop,
     test_wait,
+    try_wait,
     pending_count,
     pub fn suffix(self: MbarrierOp) []const u8 {
         return "." ++ @tagName(self);
@@ -593,6 +605,13 @@ pub fn Shared(comptime ty_: PtxType) type {
         pub const ty = ty_;
         name: []const u8,
         offset: i32 = 0,
+
+        pub fn at(comptime self: @This(), comptime byte_offset: i32) @This() {
+            return .{
+                .name = self.name,
+                .offset = self.offset + byte_offset,
+            };
+        }
     };
 }
 
@@ -602,6 +621,13 @@ pub fn Global(comptime ty_: PtxType) type {
         pub const ty = ty_;
         name: []const u8,
         offset: i32 = 0,
+
+        pub fn at(comptime self: @This(), comptime byte_offset: i32) @This() {
+            return .{
+                .name = self.name,
+                .offset = self.offset + byte_offset,
+            };
+        }
     };
 }
 
@@ -611,7 +637,36 @@ pub fn Const(comptime ty_: PtxType) type {
         pub const ty = ty_;
         name: []const u8,
         offset: i32 = 0,
+
+        pub fn at(comptime self: @This(), comptime byte_offset: i32) @This() {
+            return .{
+                .name = self.name,
+                .offset = self.offset + byte_offset,
+            };
+        }
     };
+}
+
+pub fn AddrWrapper(comptime T: type) type {
+    return struct {
+        val: T,
+        pub const is_addr_wrapper = true;
+    };
+}
+
+pub fn addr(val: anytype) AddrWrapper(@TypeOf(val)) {
+    return .{ .val = val };
+}
+
+pub fn BraceWrapper(comptime T: type) type {
+    return struct {
+        val: T,
+        pub const is_brace_wrapper = true;
+    };
+}
+
+pub fn brace(val: anytype) BraceWrapper(@TypeOf(val)) {
+    return .{ .val = val };
 }
 
 pub const sreg = struct {
@@ -1386,6 +1441,12 @@ fn fmtOp(comptime op: anytype) []const u8 {
             }
         },
         .@"struct" => {
+            if (@hasDecl(T, "is_addr_wrapper")) {
+                return fmtAddr(op.val);
+            }
+            if (@hasDecl(T, "is_brace_wrapper")) {
+                return fmtBraceList(op.val);
+            }
             if (T == ParamHandle) {
                 if (op.offset == 0) {
                     return std.fmt.comptimePrint("{s}", .{op.name});
@@ -1479,6 +1540,10 @@ fn fmtOperandList(comptime args: anytype) []const u8 {
     return res;
 }
 
+fn fmtBraceList(comptime args: anytype) []const u8 {
+    return "{" ++ fmtOperandList(args) ++ "}";
+}
+
 fn operandCount(comptime args: anytype) usize {
     const info = @typeInfo(@TypeOf(args));
     if (info != .@"struct") {
@@ -1564,12 +1629,12 @@ fn instructionForm(comptime op: Opcode) InstructionForm {
         },
         .st => .{
             .op = .st,
-            .allowed_spaces = &.{ .global, .local, .shared },
+            .allowed_spaces = &.{ .global, .local, .param, .shared },
             .allowed_vecs = &.{ .s1, .v2, .v4 },
         },
         .cvta => .{
             .op = .cvta,
-            .allowed_spaces = &.{ .global, .local, .shared, .const_space },
+            .allowed_spaces = &.{ .global, .local, .param, .shared, .const_space },
             .allowed_vecs = &.{.s1},
             .allowed_scalars = &.{ .u32, .u64 },
         },
@@ -1813,6 +1878,733 @@ fn entryU32Directive(comptime name: []const u8, comptime value: u32) []const u8 
     return std.fmt.comptimePrint("{s} {d}\n", .{ name, value });
 }
 
+pub const CpAsyncOp = enum { normal, bulk, bulk_tensor };
+pub const CpAsyncBuilder = struct {
+    kb: *KernelBuilder,
+    op: CpAsyncOp,
+    dims_val: ?u32 = null,
+    cache_policy_val: ?[]const u8 = null,
+    cache_hint_val: ?CacheLevel = null,
+    mbarrier_val: ?[]const u8 = null,
+
+    pub fn dims(comptime self: @This(), comptime d: u32) @This() {
+        var copy = self;
+        copy.dims_val = d;
+        return copy;
+    }
+
+    pub fn cache_policy(comptime self: @This(), comptime pol: []const u8) @This() {
+        var copy = self;
+        copy.cache_policy_val = pol;
+        return copy;
+    }
+
+    pub fn cache_hint(comptime self: @This(), comptime hint: CacheLevel) @This() {
+        var copy = self;
+        copy.cache_hint_val = hint;
+        return copy;
+    }
+
+    pub fn mbarrier(comptime self: @This(), comptime mb: []const u8) @This() {
+        var copy = self;
+        copy.mbarrier_val = mb;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) void {
+        var s: []const u8 = "cp.async";
+        switch (self.op) {
+            .normal => {
+                const pol = self.cache_policy_val orelse "ca";
+                s = s ++ "." ++ pol ++ ".shared.global";
+
+                // Validation for normal cp.async
+                const info = @typeInfo(@TypeOf(args));
+                if (info.@"struct".fields.len >= 3) {
+                    const dst = @field(args, info.@"struct".fields[0].name);
+                    const src = @field(args, info.@"struct".fields[1].name);
+                    const size = @field(args, info.@"struct".fields[2].name);
+                    validateOperandStateSpace(dst, .shared, "cp.async destination");
+                    validateOperandStateSpace(src, .global, "cp.async source");
+                    self.kb.validateForm(.{
+                        .op = .cp_async,
+                        .space = .shared,
+                        .copy_size = comptimeImmediateU32(size),
+                    });
+                }
+            },
+            .bulk => {
+                s = s ++ ".bulk.shared::cluster.global";
+                if (self.mbarrier_val) |mb| s = s ++ ".mbarrier::" ++ mb;
+
+                // Validation for bulk
+                const info = @typeInfo(@TypeOf(args));
+                if (info.@"struct".fields.len >= 2) {
+                    const dst = @field(args, info.@"struct".fields[0].name);
+                    const src = @field(args, info.@"struct".fields[1].name);
+                    validateOperandStateSpace(dst, .shared, "cp.async.bulk destination");
+                    validateOperandStateSpace(src, .global, "cp.async.bulk source");
+                    self.kb.validateForm(.{ .op = .cp_async_bulk, .space = .shared, .ty = PtxType.b8 });
+                }
+                if (info.@"struct".fields.len >= 4) {
+                    const flag = @field(args, info.@"struct".fields[3].name);
+                    validateOperandStateSpace(flag, .shared, "cp.async.bulk barrier flag");
+                }
+            },
+            .bulk_tensor => {
+                s = s ++ ".bulk.tensor." ++ std.fmt.comptimePrint("{d}d", .{self.dims_val.?});
+                s = s ++ ".shared::cta.global.tile";
+                if (self.mbarrier_val) |mb| s = s ++ ".mbarrier::" ++ mb;
+                if (self.cache_hint_val) |ch| s = s ++ ch.suffix() ++ "::cache_hint";
+
+                // Validation for tensor
+                const info = @typeInfo(@TypeOf(args));
+                if (info.@"struct".fields.len >= 4) {
+                    const dst = @field(args, info.@"struct".fields[0].name);
+                    const mbar = @field(args, info.@"struct".fields[3].name);
+                    validateOperandStateSpace(dst, .shared, "cp.async.bulk.tensor destination");
+                    validateOperandStateSpace(mbar, .shared, "cp.async.bulk.tensor mbarrier");
+                    self.kb.validateForm(.{ .op = .cp_async_bulk, .space = .shared, .ty = PtxType.b8 });
+                }
+            },
+        }
+        self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+    }
+};
+
+pub const LdStOp = enum { ld, st, ldu };
+pub const LdStBuilder = struct {
+    kb: *KernelBuilder,
+    op: LdStOp,
+    space_val: ?StateSpace = null,
+    order_val: MemOrder = .none,
+    scope_val: Scope = .none,
+    volatile_val: bool = false,
+    weak_val: bool = false,
+    ty_val: ?PtxType = null,
+
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) if (self.op == .st) void else Reg(self.ty_val.?) {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.op);
+        const sp = self.space_val orelse if (self.op == .ldu) .global else @compileError("Space required for " ++ @tagName(self.op));
+
+        s = s ++ sp.suffix();
+        if (self.volatile_val) s = s ++ ".volatile";
+        if (self.weak_val) s = s ++ ".weak";
+        if (self.order_val != .none) s = s ++ self.order_val.suffix();
+        if (self.scope_val != .none) s = s ++ self.scope_val.suffix();
+        s = s ++ t.suffix();
+
+        self.kb.validateForm(.{ .op = if (self.op == .ldu) .ldu else if (self.op == .st) .st else .ld, .space = sp, .ty = t });
+
+        const info = @typeInfo(@TypeOf(args));
+        if (self.op == .st) {
+            const addr_arg = @field(args, info.@"struct".fields[0].name);
+            const val_arg = @field(args, info.@"struct".fields[1].name);
+            validateMemoryAddressOperand(addr_arg, sp, t, "st address");
+            validateOperandWidth(val_arg, t, "st value");
+            self.kb.line(s ++ " " ++ fmtAddr(addr_arg) ++ ", " ++ fmtOp(val_arg) ++ ";");
+        } else {
+            const addr_arg = @field(args, info.@"struct".fields[0].name);
+            validateMemoryAddressOperand(addr_arg, sp, t, "ld address");
+            const dst = self.kb.tmp(t);
+            self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtAddr(addr_arg) ++ ";");
+            return dst;
+        }
+    }
+};
+
+pub const AtomRedBuilder = struct {
+    kb: *KernelBuilder,
+    instruction: Opcode, // .atom or .red
+    op: AtomOp,
+    space_val: ?StateSpace = null,
+    order_val: MemOrder = .none,
+    scope_val: Scope = .none,
+    ty_val: ?PtxType = null,
+
+    pub fn space(comptime self: @This(), comptime s: StateSpace) @This() {
+        var copy = self;
+        copy.space_val = s;
+        return copy;
+    }
+    pub fn relaxed(comptime self: @This()) @This() {
+        var copy = self;
+        copy.order_val = .relaxed;
+        return copy;
+    }
+    pub fn acquire(comptime self: @This()) @This() {
+        var copy = self;
+        copy.order_val = .acquire;
+        return copy;
+    }
+    pub fn release(comptime self: @This()) @This() {
+        var copy = self;
+        copy.order_val = .release;
+        return copy;
+    }
+    pub fn acq_rel(comptime self: @This()) @This() {
+        var copy = self;
+        copy.order_val = .acq_rel;
+        return copy;
+    }
+    pub fn scope(comptime self: @This(), comptime s: Scope) @This() {
+        var copy = self;
+        copy.scope_val = s;
+        return copy;
+    }
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) if (self.instruction == .red) void else Reg(self.ty_val.?) {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        const sp = self.space_val orelse .global;
+
+        s = s ++ sp.suffix();
+        if (self.order_val != .none) s = s ++ self.order_val.suffix();
+        if (self.scope_val != .none) s = s ++ self.scope_val.suffix();
+        s = s ++ self.op.suffix();
+        s = s ++ t.suffix();
+
+        self.kb.validateForm(.{ .op = self.instruction, .space = sp, .ty = t, .atom_op = self.op });
+
+        const info = @typeInfo(@TypeOf(args));
+        if (self.instruction == .red) {
+            const addr_arg = @field(args, info.@"struct".fields[0].name);
+            const val_arg = @field(args, info.@"struct".fields[1].name);
+            validateMemoryAddressOperand(addr_arg, sp, t, "red address");
+            validateOperandWidth(val_arg, t, "red value");
+            self.kb.line(s ++ " " ++ fmtAddr(addr_arg) ++ ", " ++ fmtOp(val_arg) ++ ";");
+        } else {
+            const addr_arg = @field(args, info.@"struct".fields[0].name);
+            const val_arg = @field(args, info.@"struct".fields[1].name);
+            validateMemoryAddressOperand(addr_arg, sp, t, "atom address");
+            validateOperandWidth(val_arg, t, "atom value");
+            const dst = self.kb.tmp(t);
+            self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtAddr(addr_arg) ++ ", " ++ fmtOp(val_arg) ++ ";");
+            return dst;
+        }
+    }
+};
+
+pub const CvtBuilder = struct {
+    kb: *KernelBuilder,
+    rnd_val: RoundingMode = .none,
+    sat_val: bool = false,
+    dst_ty_val: ?PtxType = null,
+    src_ty_val: ?PtxType = null,
+
+    pub fn rn(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rn;
+        return copy;
+    }
+    pub fn rz(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rz;
+        return copy;
+    }
+    pub fn rm(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rm;
+        return copy;
+    }
+    pub fn rp(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rp;
+        return copy;
+    }
+    pub fn sat(comptime self: @This()) @This() {
+        var copy = self;
+        copy.sat_val = true;
+        return copy;
+    }
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.dst_ty_val = t;
+        return copy;
+    }
+    pub fn dst(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.dst_ty_val = t;
+        return copy;
+    }
+    pub fn src(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.src_ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), a: anytype) Reg(self.dst_ty_val.?) {
+        const dt = self.dst_ty_val.?;
+        const st = self.src_ty_val.?;
+        var s: []const u8 = "cvt";
+        if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
+        if (self.sat_val) s = s ++ ".sat";
+        s = s ++ dt.suffix() ++ st.suffix();
+        const dst_reg = self.kb.tmp(dt);
+        self.kb.line(s ++ " " ++ fmtOp(dst_reg) ++ ", " ++ fmtOp(a) ++ ";");
+        return dst_reg;
+    }
+};
+
+pub const CvtaBuilder = struct {
+    kb: *KernelBuilder,
+    dir_val: CvtDirection = .to,
+    space_val: ?StateSpace = null,
+    ty_val: ?PtxType = null,
+
+    pub fn to(comptime self: @This()) @This() {
+        var copy = self;
+        copy.dir_val = .to;
+        return copy;
+    }
+    pub fn from(comptime self: @This()) @This() {
+        var copy = self;
+        copy.dir_val = .from;
+        return copy;
+    }
+    pub fn space(comptime self: @This(), comptime s: StateSpace) @This() {
+        var copy = self;
+        copy.space_val = s;
+        return copy;
+    }
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), a: anytype) Reg(self.ty_val.?) {
+        const t = self.ty_val.?;
+        const sp = self.space_val.?;
+        const s = std.fmt.comptimePrint("cvta{s}{s}{s}", .{ self.dir_val.suffix(), sp.suffix(), t.suffix() });
+        self.kb.validateForm(.{ .op = .cvta, .space = sp, .ty = t });
+        const dst = self.kb.tmp(t);
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOp(a) ++ ";");
+        return dst;
+    }
+
+    pub fn callInto(comptime self: @This(), dst: anytype, src: anytype) void {
+        const t = self.ty_val.?;
+        const sp = self.space_val.?;
+        const s = std.fmt.comptimePrint("cvta{s}{s}{s}", .{ self.dir_val.suffix(), sp.suffix(), t.suffix() });
+        self.kb.validateForm(.{ .op = .cvta, .space = sp, .ty = t });
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOp(src) ++ ";");
+    }
+};
+
+pub const MulMadBuilder = struct {
+    kb: *KernelBuilder,
+    instruction: Opcode, // .mul or .mad
+    mode_val: enum { none, lo, hi, wide } = .none,
+    rnd_val: RoundingMode = .none,
+    sat_val: bool = false,
+    ty_val: ?PtxType = null,
+
+    pub fn lo(comptime self: @This()) @This() {
+        var copy = self;
+        copy.mode_val = .lo;
+        return copy;
+    }
+    pub fn hi(comptime self: @This()) @This() {
+        var copy = self;
+        copy.mode_val = .hi;
+        return copy;
+    }
+    pub fn wide(comptime self: @This()) @This() {
+        var copy = self;
+        copy.mode_val = .wide;
+        return copy;
+    }
+    pub fn rn(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rn;
+        return copy;
+    }
+    pub fn sat(comptime self: @This()) @This() {
+        var copy = self;
+        copy.sat_val = true;
+        return copy;
+    }
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) Reg(self.ty_val.?) {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        var mode_str: []const u8 = "";
+        if (self.mode_val != .none) {
+            mode_str = "." ++ @tagName(self.mode_val);
+        } else {
+            switch (t.scalar) {
+                .f16, .f16x2, .f32, .f64, .bf16, .bf16x2 => {},
+                else => mode_str = ".lo",
+            }
+        }
+        s = s ++ mode_str;
+        if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
+        if (self.sat_val) s = s ++ ".sat";
+        s = s ++ t.suffix();
+
+        const dst = self.kb.tmp(t);
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+        return dst;
+    }
+};
+
+pub const ArithmeticBuilder = struct {
+    kb: *KernelBuilder,
+    instruction: Opcode,
+    ty_val: ?PtxType = null,
+    sat_val: bool = false,
+    rnd_val: RoundingMode = .none,
+
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+    pub fn sat(comptime self: @This()) @This() {
+        var copy = self;
+        copy.sat_val = true;
+        return copy;
+    }
+    pub fn rn(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rn;
+        return copy;
+    }
+    pub fn rz(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rz;
+        return copy;
+    }
+    pub fn rm(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rm;
+        return copy;
+    }
+    pub fn rp(comptime self: @This()) @This() {
+        var copy = self;
+        copy.rnd_val = .rp;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) Reg(self.ty_val.?) {
+        const t = self.ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        if (self.rnd_val != .none) s = s ++ self.rnd_val.suffix();
+        if (self.sat_val) s = s ++ ".sat";
+        s = s ++ t.suffix();
+
+        self.kb.validateForm(.{ .op = self.instruction, .ty = t });
+        const dst = self.kb.tmp(t);
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+        return dst;
+    }
+};
+
+pub const MmaBuilder = struct {
+    kb: *KernelBuilder,
+    instruction: Opcode = .mma,
+    shape_val: ?MmaShape = null,
+    layout_val: ?MmaLayout = null,
+    d_ty_val: ?PtxType = null,
+    a_ty_val: ?PtxType = null,
+    b_ty_val: ?PtxType = null,
+    c_ty_val: ?PtxType = null,
+
+    pub fn shape(comptime self: @This(), comptime s: MmaShape) @This() {
+        var copy = self;
+        copy.shape_val = s;
+        return copy;
+    }
+    pub fn layout(comptime self: @This(), comptime l: MmaLayout) @This() {
+        var copy = self;
+        copy.layout_val = l;
+        return copy;
+    }
+    pub fn d_ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.d_ty_val = t;
+        return copy;
+    }
+    pub fn a_ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.a_ty_val = t;
+        return copy;
+    }
+    pub fn b_ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.b_ty_val = t;
+        return copy;
+    }
+    pub fn c_ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.c_ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) Reg(self.d_ty_val.?) {
+        const dt = self.d_ty_val.?;
+        var s: []const u8 = @tagName(self.instruction);
+        if (self.instruction == .wgmma_mma_async) {
+            s = s ++ ".sync.aligned";
+        } else {
+            s = s ++ ".sync.aligned";
+        }
+        s = s ++ self.shape_val.?.suffix();
+        s = s ++ self.layout_val.?.suffix();
+        s = s ++ dt.suffix() ++ self.a_ty_val.?.suffix() ++ self.b_ty_val.?.suffix() ++ self.c_ty_val.?.suffix();
+
+        const dst = self.kb.tmp(dt);
+        self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+        return dst;
+    }
+};
+
+pub const SyncBuilder = struct {
+    kb: *KernelBuilder,
+    instruction: Opcode,
+    mode_val: ?[]const u8 = null,
+    ty_val: ?PtxType = null,
+
+    pub fn mode(comptime self: @This(), comptime m: anytype) @This() {
+        var copy = self;
+        copy.mode_val = if (@TypeOf(m) == []const u8) m else @tagName(m);
+        return copy;
+    }
+    pub fn ty(comptime self: @This(), comptime t: PtxType) @This() {
+        var copy = self;
+        copy.ty_val = t;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) if (self.ty_val) |t| Reg(t) else void {
+        var s: []const u8 = @tagName(self.instruction);
+        if (std.mem.eql(u8, s, "shfl") or std.mem.eql(u8, s, "vote") or std.mem.eql(u8, s, "match")) {
+            s = s ++ ".sync";
+        }
+        if (self.mode_val) |m| s = s ++ "." ++ m;
+        if (self.ty_val) |t| s = s ++ t.suffix();
+
+        if (self.ty_val) |t| {
+            const dst = self.kb.tmp(t);
+            self.kb.line(s ++ " " ++ fmtOp(dst) ++ ", " ++ fmtOperandList(args) ++ ";");
+            return dst;
+        } else {
+            self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+        }
+    }
+};
+
+pub const Tcgen05Op = enum { alloc, dealloc, mma, commit };
+pub const Tcgen05Builder = struct {
+    kb: *KernelBuilder,
+    op: Tcgen05Op,
+    cg_size: u32 = 1,
+    kind_val: ?PtxType = null,
+
+    pub fn cta_group(comptime self: @This(), comptime size: u32) @This() {
+        var copy = self;
+        copy.cg_size = size;
+        return copy;
+    }
+
+    pub fn kind(comptime self: @This(), comptime ty: PtxType) @This() {
+        var copy = self;
+        copy.kind_val = ty;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) void {
+        self.kb.validateTarget(.tcgen05);
+        var s: []const u8 = "tcgen05." ++ @tagName(self.op) ++ ".cta_group::" ++ std.fmt.comptimePrint("{d}", .{self.cg_size});
+        if (self.op == .alloc or self.op == .dealloc) {
+            s = s ++ ".sync.aligned";
+        }
+        if (self.op == .commit) {
+            s = s ++ ".mbarrier::arrive::one.shared::cluster.b64";
+        } else if (self.op == .mma) {
+            s = s ++ ".kind::" ++ self.kind_val.?.suffix()[1..];
+        } else if (self.op == .alloc) {
+            s = s ++ ".shared::cta.b32";
+        } else if (self.op == .dealloc) {
+            s = s ++ ".b32";
+        }
+        self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+    }
+};
+
+pub const MbarrierBuilder = struct {
+    kb: *KernelBuilder,
+    op: MbarrierOp,
+    expect_tx_val: bool = false,
+    parity_val: bool = false,
+    release_val: bool = false,
+    acquire_val: bool = false,
+    scope_val: ?Scope = null,
+    space_val: ?StateSpace = null,
+    shared_scope_val: ?Scope = null,
+
+    pub fn expect_tx(comptime self: @This()) @This() {
+        var copy = self;
+        copy.expect_tx_val = true;
+        return copy;
+    }
+    pub fn parity(comptime self: @This()) @This() {
+        var copy = self;
+        copy.parity_val = true;
+        return copy;
+    }
+    pub fn release(comptime self: @This()) @This() {
+        var copy = self;
+        copy.release_val = true;
+        return copy;
+    }
+    pub fn acquire(comptime self: @This()) @This() {
+        var copy = self;
+        copy.acquire_val = true;
+        return copy;
+    }
+    pub fn scope(comptime self: @This(), comptime sc: Scope) @This() {
+        var copy = self;
+        copy.scope_val = sc;
+        return copy;
+    }
+    pub fn space(comptime self: @This(), comptime sp: StateSpace) @This() {
+        var copy = self;
+        copy.space_val = sp;
+        return copy;
+    }
+    pub fn shared_scope(comptime self: @This(), comptime sc: Scope) @This() {
+        var copy = self;
+        copy.shared_scope_val = sc;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) void {
+        self.kb.validateTarget(.mbarrier);
+        var s: []const u8 = "mbarrier." ++ @tagName(self.op);
+        if (self.expect_tx_val) s = s ++ ".expect_tx";
+        if (self.parity_val) s = s ++ ".parity";
+        if (self.release_val) s = s ++ ".release";
+        if (self.acquire_val) s = s ++ ".acquire";
+        if (self.scope_val) |sc| s = s ++ sc.suffix();
+        if (self.space_val) |sp| s = s ++ sp.suffix();
+        if (self.shared_scope_val) |sc| s = s ++ "::" ++ @tagName(sc);
+        s = s ++ ".b64";
+        self.kb.line(s ++ " " ++ fmtOperandList(args) ++ ";");
+    }
+};
+
+pub const ElectBuilder = struct {
+    kb: *KernelBuilder,
+    sync_val: bool = false,
+
+    pub fn sync(comptime self: @This()) @This() {
+        var copy = self;
+        copy.sync_val = true;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), args: anytype) void {
+        self.kb.validateTarget(.tcgen05);
+        var s: []const u8 = "elect";
+        if (self.sync_val) s = s ++ ".sync";
+        const info = @typeInfo(@TypeOf(args));
+        if (info.@"struct".fields.len == 3) {
+            self.kb.line(std.fmt.comptimePrint("{s} {s}|{s}, {s};", .{
+                s,
+                fmtOp(@field(args, info.@"struct".fields[0].name)),
+                fmtOp(@field(args, info.@"struct".fields[1].name)),
+                fmtOp(@field(args, info.@"struct".fields[2].name)),
+            }));
+        } else {
+            @compileError("elect requires 3 arguments");
+        }
+    }
+};
+
+pub const FenceBuilder = struct {
+    kb: *KernelBuilder,
+    op_val: ?FenceOp = null,
+    order_val: ?MemOrder = null,
+    scope_val: ?Scope = null,
+
+    pub fn op(comptime self: @This(), comptime o: FenceOp) @This() {
+        var copy = self;
+        copy.op_val = o;
+        return copy;
+    }
+    pub fn order(comptime self: @This(), comptime ord: MemOrder) @This() {
+        var copy = self;
+        copy.order_val = ord;
+        return copy;
+    }
+    pub fn scope(comptime self: @This(), comptime sc: Scope) @This() {
+        var copy = self;
+        copy.scope_val = sc;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This()) void {
+        var s: []const u8 = "fence";
+        if (self.op_val) |o| s = s ++ o.suffix();
+        if (self.order_val) |ord| s = s ++ ord.suffix();
+        if (self.scope_val) |sc| s = s ++ sc.suffix();
+        self.kb.line(s ++ ";");
+    }
+};
+
+pub const PrefetchBuilder = struct {
+    kb: *KernelBuilder,
+    space_val: ?StateSpace = null,
+    level_val: ?CacheLevel = null,
+    tensormap_val: bool = false,
+
+    pub fn space(comptime self: @This(), comptime sp: StateSpace) @This() {
+        var copy = self;
+        copy.space_val = sp;
+        return copy;
+    }
+    pub fn level(comptime self: @This(), comptime lv: CacheLevel) @This() {
+        var copy = self;
+        copy.level_val = lv;
+        return copy;
+    }
+    pub fn tensormap(comptime self: @This()) @This() {
+        var copy = self;
+        copy.tensormap_val = true;
+        return copy;
+    }
+
+    pub fn call(comptime self: @This(), addr_op: anytype) void {
+        var s: []const u8 = "prefetch";
+        if (self.tensormap_val) {
+            s = s ++ ".tensormap";
+        } else {
+            if (self.space_val) |sp| s = s ++ sp.suffix();
+            if (self.level_val) |lv| s = s ++ lv.suffix();
+        }
+        self.kb.line(std.fmt.comptimePrint("{s} {s};", .{ s, fmtAddr(addr_op) }));
+    }
+};
+
 // --- Kernel Builder ---
 
 pub const KernelBuilder = struct {
@@ -1832,16 +2624,16 @@ pub const KernelBuilder = struct {
     params_text: []const u8 = "",
     active_predicate: ?[]const u8 = null,
     counts: struct {
-        p: u32 = 0,   // %p (.pred)
-        b: u32 = 0,   // %b (.b8)
-        h: u32 = 0,   // %h (.b16)
-        r: u32 = 0,   // %r (.b32)
-        rd: u32 = 0,  // %rd (.b64)
-        q: u32 = 0,   // %q (.b128)
-        hf: u32 = 0,  // %hf (.f16)
-        f: u32 = 0,   // %f (.f32)
-        fd: u32 = 0,  // %fd (.f64)
-        v: u32 = 0,   // %v (others)
+        p: u32 = 0, // %p (.pred)
+        b: u32 = 0, // %b (.b8)
+        h: u32 = 0, // %h (.b16)
+        r: u32 = 0, // %r (.b32)
+        rd: u32 = 0, // %rd (.b64)
+        q: u32 = 0, // %q (.b128)
+        hf: u32 = 0, // %hf (.f16)
+        f: u32 = 0, // %f (.f32)
+        fd: u32 = 0, // %fd (.f64)
+        v: u32 = 0, // %v (others)
     } = .{},
     shared_decls: []const u8 = "",
     param_decls: []const u8 = "",
@@ -2095,11 +2887,11 @@ pub const KernelBuilder = struct {
     }
 
     pub fn ldArgAt(comptime self: *KernelBuilder, comptime index: usize) Reg(self.paramTypeAt(index)) {
-        return self.ldParam(self.argAt(index));
+        return self.ld(.param, self.paramTypeAt(index), self.argAt(index));
     }
 
     pub fn ldArg(comptime self: *KernelBuilder, comptime name: []const u8) Reg(self.paramType(name)) {
-        return self.ldParam(self.arg(name));
+        return self.ld(.param, self.paramType(name), self.arg(name));
     }
 
     fn marshalCallArgs(comptime self: *KernelBuilder, comptime callee: *const KernelBuilder, args: anytype) []const u8 {
@@ -2169,354 +2961,340 @@ pub const KernelBuilder = struct {
     }
 
     pub fn abs(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.abs, ty);
+        self.validateForm(.{ .op = .abs, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("abs{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn add(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.add, ty);
+        self.validateForm(.{ .op = .add, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("add{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn add_cc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.add_cc, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("add.cc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
     pub fn addc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.addc, ty);
+        self.validateForm(.{ .op = .addc, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("addc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn @"and"(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.@"and", ty);
+        self.validateForm(.{ .op = .@"and", .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("and{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn bfe(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.bfe, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("bfe{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn bfi(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype, d: anytype) Reg(ty) {
-        validate(.bfi, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("bfi{s} {s}, {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c), fmtOp(d) }));
-        return dst;
-    }
     pub fn bfind(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.bfind, ty);
+        self.validateForm(.{ .op = .bfind, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("bfind{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn bmsk(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.bmsk, ty);
+        self.validateForm(.{ .op = .bmsk, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("bmsk{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn brev(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.brev, ty);
+        self.validateForm(.{ .op = .brev, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("brev{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn clz(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.clz, ty);
+        self.validateForm(.{ .op = .clz, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("clz{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn cnot(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.cnot, ty);
+        self.validateForm(.{ .op = .cnot, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("cnot{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn copysign(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.copysign, ty);
+        self.validateForm(.{ .op = .copysign, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("copysign{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn cos(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.cos, ty);
+        self.validateForm(.{ .op = .cos, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("cos.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn div(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.div, ty);
+        self.validateForm(.{ .op = .div, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("div.approx{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn ex2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.ex2, ty);
+        self.validateForm(.{ .op = .ex2, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("ex2.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn fma(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.fma, ty);
+        self.validateForm(.{ .op = .fma, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("fma.rn{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
     pub fn lg2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.lg2, ty);
+        self.validateForm(.{ .op = .lg2, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("lg2.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn lop3(comptime self: *KernelBuilder, a: anytype, b: anytype, c: anytype, comptime imm: u8) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("lop3.b32 {s}, {s}, {s}, {s}, 0x{x:0>2};", .{ fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c), imm }));
-        return dst;
-    }
-    pub fn clmad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.clmad, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("clmad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn redux(comptime self: *KernelBuilder, comptime op: AtomOp, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.redux, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("redux.sync{s}{s} {s}, {s}, 0xFFFFFFFF;", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
-    pub fn szext(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.szext, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("szext{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn mad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.mad, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn mad_cc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.mad_cc, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mad.cc{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn mad24(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.mad24, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mad24.lo{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn madc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.madc, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("madc{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn max(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.max, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("max{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn min(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.min, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("min{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn mov(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.mov, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mov{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
-    pub fn movSpecial(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        return self.mov(ty, a);
-    }
-    pub fn mul(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.mul, ty);
-        const dst = self.tmp(ty);
-        const mod = switch (ty.scalar) {
-            .f16, .f16x2, .f32, .f64, .bf16, .bf16x2 => "",
-            else => ".lo",
-        };
-        self.line(std.fmt.comptimePrint("mul{s}{s} {s}, {s}, {s};", .{ mod, ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn mul24(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.mul24, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("mul24.lo{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
     pub fn neg(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.neg, ty);
+        self.validateForm(.{ .op = .neg, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("neg{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn not(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.not, ty);
+        self.validateForm(.{ .op = .not, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("not{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn @"or"(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.@"or", ty);
+        self.validateForm(.{ .op = .@"or", .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("or{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn popc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.popc, ty);
+        self.validateForm(.{ .op = .popc, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("popc{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn fns(comptime self: *KernelBuilder, a: anytype, b: anytype, c: anytype) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("fns.b32 {s}, {s}, {s}, {s};", .{ fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
     pub fn rcp(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.rcp, ty);
+        self.validateForm(.{ .op = .rcp, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("rcp.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn rem(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.rem, ty);
+        self.validateForm(.{ .op = .rem, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("rem{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
     pub fn rsqrt(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.rsqrt, ty);
+        self.validateForm(.{ .op = .rsqrt, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("rsqrt.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn sad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.sad, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("sad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn selp(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.selp, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("selp{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn set(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, comptime src_ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.set, src_ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("set{s}{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn setp(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype) Reg(PtxType.pred) {
-        validate(.setp, ty);
-        const dst = self.tmp(PtxType.pred);
-        self.line(std.fmt.comptimePrint("setp{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn shf(comptime self: *KernelBuilder, comptime dir: Direction, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.shf, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("shf{s}.clamp{s} {s}, {s}, {s}, {s};", .{ dir.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn shl(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.shl, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("shl{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn label(comptime self: *KernelBuilder, comptime name: []const u8) void {
-        self.raw(name ++ ":\n");
-    }
-    pub fn shr(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.shr, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("shr{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
     pub fn sin(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.sin, ty);
+        self.validateForm(.{ .op = .sin, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("sin.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn slct(comptime self: *KernelBuilder, comptime ty: PtxType, comptime src_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.slct, src_ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("slct{s}{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
     pub fn sqrt(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.sqrt, ty);
+        self.validateForm(.{ .op = .sqrt, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("sqrt.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
     pub fn sub(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.sub, ty);
+        self.validateForm(.{ .op = .sub, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("sub{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn sub_cc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.sub_cc, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("sub.cc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn subc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.subc, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("subc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
     pub fn tanh(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
-        validate(.tanh, ty);
+        self.validateForm(.{ .op = .tanh, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("tanh.approx{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
-    pub fn testp(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype) Reg(PtxType.pred) {
-        validate(.testp, ty);
-        const dst = self.tmp(PtxType.pred);
-        self.line(std.fmt.comptimePrint("testp{s}{s} {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
     pub fn xor(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        validate(.xor, ty);
+        self.validateForm(.{ .op = .xor, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("xor{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn cvt(comptime self: *KernelBuilder, comptime dst_ty: PtxType, comptime src_ty: PtxType, a: anytype, comptime rnd: RoundingMode) Reg(dst_ty) {
-        validate(.cvt, dst_ty);
-        const dst = self.tmp(dst_ty);
-        self.line(std.fmt.comptimePrint("cvt{s}{s}{s} {s}, {s};", .{ rnd.suffix(), dst_ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a) }));
+    pub fn szext(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .szext, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("szext{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn cvta(comptime self: *KernelBuilder, comptime dir: CvtDirection, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
-        self.validateForm(.{ .op = .cvta, .space = space, .ty = ty });
+
+    pub fn add_cc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .add, .ty = ty });
         const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("cvta{s}{s}{s} {s}, {s};", .{ dir.suffix(), space.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        self.line(std.fmt.comptimePrint("add.cc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
+    }
+
+    pub fn bfe(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .bfe, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("bfe{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn bfi(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype, d: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .bfi, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("bfi{s} {s}, {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c), fmtOp(d) }));
+        return dst;
+    }
+
+    pub fn lop3(comptime self: *KernelBuilder, a: anytype, b: anytype, c: anytype, comptime imm: u8) Reg(PtxType.b32) {
+        const dst = self.tmp(PtxType.b32);
+        self.line(std.fmt.comptimePrint("lop3.b32 {s}, {s}, {s}, {s}, 0x{x:0>2};", .{ fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c), imm }));
+        return dst;
+    }
+
+    pub fn clmad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .clmad, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("clmad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn redux(comptime self: *KernelBuilder, comptime op: AtomOp, comptime ty: PtxType, a: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .redux, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("redux.sync{s}{s} {s}, {s}, 0xFFFFFFFF;", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        return dst;
+    }
+
+    pub fn mad(comptime self: *KernelBuilder) MulMadBuilder {
+        return .{ .kb = self, .instruction = .mad };
+    }
+    pub fn mul(comptime self: *KernelBuilder) MulMadBuilder {
+        return .{ .kb = self, .instruction = .mul };
+    }
+
+    pub fn max(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .max, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("max{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn min(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .min, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("min{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn mov(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .mov, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("mov{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        return dst;
+    }
+
+    pub fn movSpecial(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(ty) {
+        return self.mov(ty, a);
+    }
+
+    pub fn mul24(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .mul24, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("mul24.lo{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn fns(comptime self: *KernelBuilder, a: anytype, b: anytype, c: anytype) Reg(PtxType.b32) {
+        const dst = self.tmp(PtxType.b32);
+        self.line(std.fmt.comptimePrint("fns.b32 {s}, {s}, {s}, {s};", .{ fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn sad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .sad, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("sad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn selp(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .selp, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("selp{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn set(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, comptime src_ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .set, .ty = src_ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("set{s}{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn setp(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype) Reg(PtxType.pred) {
+        self.validateForm(.{ .op = .setp, .ty = ty });
+        const dst = self.tmp(PtxType.pred);
+        self.line(std.fmt.comptimePrint("setp{s}{s} {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn shf(comptime self: *KernelBuilder, comptime dir: Direction, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .shf, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("shf{s}.clamp{s} {s}, {s}, {s}, {s};", .{ dir.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn shl(comptime self: *KernelBuilder) ArithmeticBuilder {
+        return .{ .kb = self, .instruction = .shl };
+    }
+
+    pub fn shr(comptime self: *KernelBuilder) ArithmeticBuilder {
+        return .{ .kb = self, .instruction = .shr };
+    }
+
+    pub fn slct(comptime self: *KernelBuilder, comptime ty: PtxType, comptime src_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .slct, .ty = src_ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("slct{s}{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), src_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn sub_cc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .sub, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("sub.cc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn subc(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .subc, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("subc{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
+        return dst;
+    }
+
+    pub fn testp(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype) Reg(PtxType.pred) {
+        self.validateForm(.{ .op = .testp, .ty = ty });
+        const dst = self.tmp(PtxType.pred);
+        self.line(std.fmt.comptimePrint("testp{s}{s} {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a) }));
+        return dst;
+    }
+
+    pub fn label(comptime self: *KernelBuilder, comptime name: []const u8) void {
+        self.raw(name ++ ":\n");
+    }
+
+    pub fn cvt(comptime self: *KernelBuilder) CvtBuilder {
+        return .{ .kb = self };
+    }
+    pub fn cvta(comptime self: *KernelBuilder) CvtaBuilder {
+        return .{ .kb = self };
     }
     pub fn ld(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype) Reg(ty) {
         self.validateForm(.{ .op = .ld, .space = space, .ty = ty });
@@ -2525,22 +3303,28 @@ pub const KernelBuilder = struct {
         self.line(std.fmt.comptimePrint("ld{s}{s} {s}, {s};", .{ space.suffix(), ty.suffix(), fmtOp(dst), fmtAddr(a) }));
         return dst;
     }
+    pub fn ld_ex(comptime self: *KernelBuilder, comptime space: StateSpace) LdStBuilder {
+        return .{ .kb = self, .op = .ld, .space_val = space };
+    }
+    pub fn ldu(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .ldu, .space = .global, .ty = ty });
+        validateMemoryAddressOperand(addr_op, .global, ty, "ldu address");
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtAddr(addr_op) }));
+        return dst;
+    }
+    pub fn ldu_ex(comptime self: *KernelBuilder) LdStBuilder {
+        return .{ .kb = self, .op = .ldu };
+    }
     pub fn st(comptime self: *KernelBuilder, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
         self.validateForm(.{ .op = .st, .space = space, .ty = ty });
         validateMemoryAddressOperand(a, space, ty, "st address");
         self.line(std.fmt.comptimePrint("st{s}{s} {s}, {s};", .{ space.suffix(), ty.suffix(), fmtAddr(a), fmtOp(b) }));
     }
-    pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
-        self.validateForm(.{ .op = .ld, .space = .param, .ty = p.ty });
-        const dst = self.tmp(p.ty);
-        self.line(std.fmt.comptimePrint("ld.param{s} {s}, {s};", .{ p.ty.suffix(), fmtOp(dst), fmtAddr(p) }));
-        return dst;
+    pub fn st_ex(comptime self: *KernelBuilder, comptime space: StateSpace) LdStBuilder {
+        return .{ .kb = self, .op = .st, .space_val = space };
     }
-    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, addr: anytype, val: anytype) void {
-        self.validateForm(.{ .op = .st, .space = .global, .ty = ty });
-        validateMemoryAddressOperand(addr, .global, ty, "st.global address");
-        self.line(std.fmt.comptimePrint("st.global{s} {s}, {s};", .{ ty.suffix(), fmtAddr(addr), fmtOp(val) }));
-    }
+
     pub fn ret(comptime self: *KernelBuilder) void {
         self.line("ret;");
     }
@@ -2554,34 +3338,75 @@ pub const KernelBuilder = struct {
         self.line("trap;");
     }
     pub fn brkpt(comptime self: *KernelBuilder) void {
-        self.line("brkpt;");
+        self.line("trap;");
     }
+
+    pub fn ldParam(comptime self: *KernelBuilder, p: ParamHandle) Reg(p.ty) {
+        return self.ld(.param, p.ty, p);
+    }
+    pub fn stGlobal(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype, val: anytype) void {
+        self.st(.global, ty, addr_op, val);
+    }
+    pub fn stParam(comptime self: *KernelBuilder, comptime p: ParamHandle, val: anytype) void {
+        self.st(.param, p.ty, p, val);
+    }
+
     pub fn bar_sync(comptime self: *KernelBuilder, a: anytype) void {
         self.line(std.fmt.comptimePrint("bar.sync {s};", .{fmtOp(a)}));
     }
+
+    pub fn bar(comptime self: *KernelBuilder, id: anytype, n: anytype) void {
+        self.line(std.fmt.comptimePrint("bar.sync {s}, {s};", .{ fmtOp(id), fmtOp(n) }));
+    }
+
     pub fn barrier(comptime self: *KernelBuilder, comptime op: BarrierOp) void {
         self.validateTarget(.barrier);
         self.line(std.fmt.comptimePrint("barrier.cluster{s};", .{op.suffix()}));
     }
+
     pub fn grpbarrier(comptime self: *KernelBuilder) void {
         self.validateTarget(.grpbarrier);
         self.line("grpbarrier.cluster;");
     }
+
     pub fn membar(comptime self: *KernelBuilder, comptime level: Scope) void {
         self.line(std.fmt.comptimePrint("membar{s};", .{level.suffix()}));
     }
-    pub fn cp_async(comptime self: *KernelBuilder, dst: anytype, src: anytype, comptime size: anytype) void {
-        validateOperandStateSpace(dst, .shared, "cp.async destination");
-        validateOperandStateSpace(src, .global, "cp.async source");
-        self.validateForm(.{ .op = .cp_async, .space = .shared, .copy_size = comptimeImmediateU32(size) });
-        self.line(std.fmt.comptimePrint("cp.async.ca.shared.global {s}, {s}, {s};", .{ fmtAddr(dst), fmtAddr(src), fmtOp(size) }));
+
+    pub fn cp_async(comptime self: *KernelBuilder, comptime op: CpAsyncOp) CpAsyncBuilder {
+        return .{ .kb = self, .op = op };
     }
-    pub fn discard(comptime self: *KernelBuilder, addr: anytype, size: anytype) void {
-        validateOperandStateSpace(addr, .global, "discard address");
-        self.line(std.fmt.comptimePrint("discard.global.b64 {s}, {s};", .{ fmtAddr(addr), fmtOp(size) }));
+
+    pub fn discard(comptime self: *KernelBuilder, addr_op: anytype, size: anytype) void {
+        validateOperandStateSpace(addr_op, .global, "discard address");
+        self.line(std.fmt.comptimePrint("discard.global.b64 {s}, {s};", .{ fmtAddr(addr_op), fmtOp(size) }));
     }
+
     pub fn bra(comptime self: *KernelBuilder, comptime target: []const u8) void {
         self.line("bra " ++ target ++ ";");
+    }
+
+    pub fn braIf(comptime self: *KernelBuilder, p: anytype, comptime is_neg: bool, comptime target: []const u8) void {
+        self.line((if (is_neg) "@!" else "@") ++ fmtOp(p) ++ " bra " ++ target ++ ";");
+    }
+
+    pub fn movInto(comptime self: *KernelBuilder, comptime ty: PtxType, dst: anytype, src: anytype) void {
+        self.validateForm(.{ .op = .mov, .ty = ty });
+        validateOperandWidth(dst, ty, "mov destination");
+        self.line(std.fmt.comptimePrint("mov{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(src) }));
+    }
+
+    pub fn cvtaParamInto(comptime self: *KernelBuilder, dst: anytype, src: anytype) void {
+        self.validateForm(.{ .op = .cvta, .space = .param, .ty = PtxType.u64 });
+        validateOperandWidth(dst, PtxType.u64, "cvta.param destination");
+        self.line(std.fmt.comptimePrint("cvta.param.u64 {s}, {s};", .{ fmtOp(dst), fmtOp(src) }));
+    }
+
+    pub fn elect(comptime self: *KernelBuilder) ElectBuilder {
+        return .{ .kb = self };
+    }
+    pub fn mbarrier(comptime self: *KernelBuilder, comptime op: MbarrierOp) MbarrierBuilder {
+        return .{ .kb = self, .op = op };
     }
 
     pub fn call(comptime self: *KernelBuilder, comptime name: []const u8, args: anytype) void {
@@ -2636,7 +3461,7 @@ pub const KernelBuilder = struct {
         const ret_slot = self.tmpParam(ret_ty);
         const marshalled_args = self.marshalCallArgs(callee, args);
         self.line("call.uni (" ++ fmtOp(ret_slot) ++ "), " ++ callee.name ++ ", (" ++ marshalled_args ++ ");");
-        return self.ldParam(ret_slot);
+        return self.ld(.param, ret_ty, ret_slot);
     }
 
     pub fn returnParam(comptime self: *KernelBuilder) ParamHandle {
@@ -2644,340 +3469,317 @@ pub const KernelBuilder = struct {
         return .{ .name = self.return_param_name, .ty = ty };
     }
 
-    pub fn stParam(comptime self: *KernelBuilder, comptime p: ParamHandle, val: anytype) void {
-        validateOperandWidth(val, p.ty, "st.param value");
-        self.line("st.param" ++ p.ty.suffix() ++ " " ++ fmtAddr(p) ++ ", " ++ fmtOp(val) ++ ";");
-    }
-
     pub fn retVal(comptime self: *KernelBuilder, val: anytype) void {
         self.stParam(self.returnParam(), val);
         self.ret();
     }
-    pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
-        self.validateForm(.{ .op = .atom, .space = space, .ty = ty, .atom_op = op });
-        validateMemoryAddressOperand(a, space, ty, "atom address");
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("atom{s}{s}{s} {s}, {s}, {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtOp(dst), fmtAddr(a), fmtOp(b) }));
-        return dst;
+
+    pub fn atom(comptime self: *KernelBuilder, comptime op: AtomOp) AtomRedBuilder {
+        return .{ .kb = self, .instruction = .atom, .op = op };
     }
-    pub fn red(comptime self: *KernelBuilder, comptime op: AtomOp, comptime space: StateSpace, comptime ty: PtxType, a: anytype, b: anytype) void {
-        self.validateForm(.{ .op = .red, .space = space, .ty = ty, .atom_op = op });
-        validateMemoryAddressOperand(a, space, ty, "red address");
-        self.line(std.fmt.comptimePrint("red{s}{s}{s} {s}, {s};", .{ space.suffix(), op.suffix(), ty.suffix(), fmtAddr(a), fmtOp(b) }));
+    pub fn red(comptime self: *KernelBuilder, comptime op: AtomOp) AtomRedBuilder {
+        return .{ .kb = self, .instruction = .red, .op = op };
     }
-    pub fn vote(comptime self: *KernelBuilder, comptime mode: VoteMode, a: anytype) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("vote{s}.b32 {s}, {s};", .{ mode.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
+
+    pub fn vote(comptime self: *KernelBuilder, comptime m: VoteMode) SyncBuilder {
+        return .{ .kb = self, .instruction = .vote }.mode(m);
     }
-    pub fn match_any(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) Reg(PtxType.b32) {
-        validate(.match, ty);
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("match.any{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
+    pub fn match(comptime self: *KernelBuilder, comptime m: enum { any, all }) SyncBuilder {
+        return .{ .kb = self, .instruction = .match }.mode(m);
     }
-    pub fn match_all(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) struct { Reg(PtxType.b32), Reg(PtxType.pred) } {
-        validate(.match, ty);
-        const dst = self.tmp(PtxType.b32);
-        const p = self.tmp(PtxType.pred);
-        self.line(std.fmt.comptimePrint("match.all{s} {s}|{s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(p), fmtOp(a) }));
-        return .{ dst, p };
+    pub fn shfl(comptime self: *KernelBuilder, comptime m: ShflMode) SyncBuilder {
+        return .{ .kb = self, .instruction = .shfl }.mode(m);
     }
-    pub fn shfl_sync(comptime self: *KernelBuilder, comptime mode: ShflMode, a: anytype, b: anytype, c: anytype, d: anytype) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("shfl.sync{s}.b32 {s}, {s}, {s}, {s}, {s};", .{ mode.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c), fmtOp(d) }));
-        return dst;
-    }
+
     pub fn prmt(comptime self: *KernelBuilder, comptime mode: PrmtMode, a: anytype, b: anytype, c: anytype) Reg(PtxType.b32) {
         const dst = self.tmp(PtxType.b32);
         self.line(std.fmt.comptimePrint("prmt.b32{s} {s}, {s}, {s}, {s};", .{ mode.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn vadd(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vadd, ty);
+        self.validateForm(.{ .op = .vadd, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vadd{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn vsub(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vsub, ty);
+        self.validateForm(.{ .op = .vsub, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vsub{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn vmin(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmin, ty);
+        self.validateForm(.{ .op = .vmin, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vmin{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn vmax(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmax, ty);
+        self.validateForm(.{ .op = .vmax, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vmax{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
-    pub fn vmax2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmax2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vmax2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vmax4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmax4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vmax4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vmin2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmin2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vmin2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vmin4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmin4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vmin4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vabsdiff(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vabsdiff, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vabsdiff{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vabsdiff2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vabsdiff2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vabsdiff2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vabsdiff4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vabsdiff4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vabsdiff4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vavrg2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vavrg2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vavrg2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vavrg4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vavrg4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vavrg4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vshl(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vshl, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vshl{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vshr(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vshr, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vshr{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vmad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vmad, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vmad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vset(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vset, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vset{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vset2(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vset2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vset2{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vset4(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vset4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vset4{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vsub2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vsub2, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vsub2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn vsub4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vsub4, ty);
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("vsub4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn tex(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype) Reg(dtype) {
-        validate(.tex, dtype);
-        const dst = self.tmp(dtype);
-        self.line(std.fmt.comptimePrint("tex{s}{s}{s} {s}, [{s}, {s}];", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(dst), fmtOp(a), fmtOp(c) }));
-        return dst;
-    }
-    pub fn tld4(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, b: anytype) Reg(dtype) {
-        validate(.tld4, dtype);
-        const dst = self.tmp(dtype);
-        self.line(std.fmt.comptimePrint("tld4.r{s}{s}{s} {s}, [{s}, {s}], {s};", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
-    }
-    pub fn txq(comptime self: *KernelBuilder, comptime query: TexQuery, a: anytype) Reg(PtxType.b32) {
-        validate(.txq, PtxType.b32);
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("txq{s}.b32 {s}, [{s}];", .{ query.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
-    pub fn suld(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime mode: SurfaceMode, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype) Reg(dtype) {
-        validate(.suld, dtype);
-        const dst = self.tmp(dtype);
-        self.line(std.fmt.comptimePrint("suld.b{s}{s}{s}{s} {s}, [{s}, {s}];", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), mode.suffix(), fmtOp(dst), fmtOp(a), fmtOp(c) }));
-        return dst;
-    }
-    pub fn sust(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime mode: SurfaceMode, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, r: anytype) void {
-        validate(.sust, dtype);
-        self.line(std.fmt.comptimePrint("sust{s}{s}{s}{s} [{s}, {s}], {s};", .{ geom.suffix(), mode.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(a), fmtOp(c), fmtOp(r) }));
-    }
-    pub fn suq(comptime self: *KernelBuilder, comptime query: SurfQuery, a: anytype) Reg(PtxType.b32) {
-        validate(.suq, PtxType.b32);
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("suq{s}.b32 {s}, [{s}];", .{ query.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
-    pub fn sured(comptime self: *KernelBuilder, comptime op: AtomOp, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, r: anytype) void {
-        validate(.sured, dtype);
-        self.line(std.fmt.comptimePrint("sured{s}{s}{s}{s} [{s}, {s}], {s};", .{ op.suffix(), geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(a), fmtOp(c), fmtOp(r) }));
-    }
+
     pub fn vadd2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vadd2, ty);
+        self.validateForm(.{ .op = .vadd2, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vadd2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn vadd4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.vadd4, ty);
+        self.validateForm(.{ .op = .vadd4, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("vadd4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
+    pub fn vsub2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vsub2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vsub2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vsub4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vsub4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vsub4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vmin2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vmin2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vmin2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vmin4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vmin4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vmin4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vmax2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vmax2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vmax2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vmax4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vmax4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vmax4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vabsdiff(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vabsdiff, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vabsdiff{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vabsdiff2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vabsdiff2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vabsdiff2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vabsdiff4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vabsdiff4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vabsdiff4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vavrg2(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vavrg2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vavrg2{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vavrg4(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vavrg4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vavrg4{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vshl(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vshl, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vshl{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vshr(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vshr, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vshr{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vmad(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vmad, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vmad{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vset(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vset, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vset{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vset2(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vset2, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vset2{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn vset4(comptime self: *KernelBuilder, comptime op: CompareOp, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
+        self.validateForm(.{ .op = .vset4, .ty = ty });
+        const dst = self.tmp(ty);
+        self.line(std.fmt.comptimePrint("vset4{s}{s} {s}, {s}, {s}, {s};", .{ op.suffix(), ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn pmevent(comptime self: *KernelBuilder, a: anytype) void {
+        self.validateForm(.{ .op = .pmevent, .ty = PtxType.u32 });
+        self.line(std.fmt.comptimePrint("pmevent {s};", .{fmtOp(a)}));
+    }
+
+    pub fn tex(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype) Reg(dtype) {
+        self.validateForm(.{ .op = .tex, .ty = dtype });
+        const dst = self.tmp(dtype);
+        self.line(std.fmt.comptimePrint("tex{s}{s}{s} {s}, [{s}, {s}];", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(dst), fmtOp(a), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn tld4(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, b: anytype) Reg(dtype) {
+        self.validateForm(.{ .op = .tld4, .ty = dtype });
+        const dst = self.tmp(dtype);
+        self.line(std.fmt.comptimePrint("tld4.r{s}{s}{s} {s}, [{s}, {s}], {s};", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn txq(comptime self: *KernelBuilder, comptime query: TexQuery, a: anytype) Reg(PtxType.b32) {
+        self.validateForm(.{ .op = .txq, .ty = PtxType.b32 });
+        const dst = self.tmp(PtxType.b32);
+        self.line(std.fmt.comptimePrint("txq{s}.b32 {s}, [{s}];", .{ query.suffix(), fmtOp(dst), fmtOp(a) }));
+        return dst;
+    }
+
+    pub fn suld(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime mode: SurfaceMode, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype) Reg(dtype) {
+        self.validateForm(.{ .op = .suld, .ty = dtype });
+        const dst = self.tmp(dtype);
+        self.line(std.fmt.comptimePrint("suld.b{s}{s}{s}{s} {s}, [{s}, {s}];", .{ geom.suffix(), dtype.suffix(), ctype.suffix(), mode.suffix(), fmtOp(dst), fmtOp(a), fmtOp(c) }));
+        return dst;
+    }
+
+    pub fn sust(comptime self: *KernelBuilder, comptime geom: TexGeom, comptime mode: SurfaceMode, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, r: anytype) void {
+        self.validateForm(.{ .op = .sust, .ty = dtype });
+        self.line(std.fmt.comptimePrint("sust{s}{s}{s}{s} [{s}, {s}], {s};", .{ geom.suffix(), mode.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(a), fmtOp(c), fmtOp(r) }));
+    }
+
+    pub fn suq(comptime self: *KernelBuilder, comptime query: SurfQuery, a: anytype) Reg(PtxType.b32) {
+        self.validateForm(.{ .op = .suq, .ty = PtxType.b32 });
+        const dst = self.tmp(PtxType.b32);
+        self.line(std.fmt.comptimePrint("suq{s}.b32 {s}, [{s}];", .{ query.suffix(), fmtOp(dst), fmtOp(a) }));
+        return dst;
+    }
+
+    pub fn sured(comptime self: *KernelBuilder, comptime op: AtomOp, comptime geom: TexGeom, comptime dtype: PtxType, comptime ctype: PtxType, a: anytype, c: anytype, r: anytype) void {
+        self.validateForm(.{ .op = .sured, .ty = dtype });
+        self.line(std.fmt.comptimePrint("sured{s}{s}{s}{s} [{s}, {s}], {s};", .{ op.suffix(), geom.suffix(), dtype.suffix(), ctype.suffix(), fmtOp(a), fmtOp(c), fmtOp(r) }));
+    }
+
     pub fn alloca(comptime self: *KernelBuilder, comptime ty: PtxType, size: anytype) Reg(ty) {
-        validate(.alloca, ty);
+        self.validateForm(.{ .op = .alloca, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("alloca{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(size) }));
         return dst;
     }
+
     pub fn stacksave(comptime self: *KernelBuilder, comptime ty: PtxType) Reg(ty) {
-        validate(.stacksave, ty);
+        self.validateForm(.{ .op = .stacksave, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("stacksave{s} {s};", .{ ty.suffix(), fmtOp(dst) }));
         return dst;
     }
+
     pub fn stackrestore(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype) void {
-        validate(.stackrestore, ty);
+        self.validateForm(.{ .op = .stackrestore, .ty = ty });
         self.line(std.fmt.comptimePrint("stackrestore{s} {s};", .{ ty.suffix(), fmtOp(a) }));
     }
+
     pub fn dp2a(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.dp2a, ty);
+        self.validateForm(.{ .op = .dp2a, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("dp2a.lo.u32.u32 {s}, {s}, {s}, {s};", .{ fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
+
     pub fn dp4a(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(ty) {
-        validate(.dp4a, ty);
+        self.validateForm(.{ .op = .dp4a, .ty = ty });
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("dp4a{s} {s}, {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
         return dst;
     }
-    pub fn bar(comptime self: *KernelBuilder, id: anytype, n: anytype) void {
-        self.line(std.fmt.comptimePrint("bar.sync {s}, {s};", .{ fmtOp(id), fmtOp(n) }));
-    }
+
     pub fn setmaxhreg(comptime self: *KernelBuilder, reg_count: anytype) void {
         self.line(std.fmt.comptimePrint("setmaxhreg.u32 {s};", .{fmtOp(reg_count)}));
     }
+
     pub fn setmaxnreg(comptime self: *KernelBuilder, reg_count: anytype) void {
         self.line(std.fmt.comptimePrint("setmaxnreg.u32 {s};", .{fmtOp(reg_count)}));
     }
-    pub fn tcgen05(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype, size: anytype) void {
-        self.validateTarget(.tcgen05);
-        validateOperandStateSpace(addr_op, .shared, "tcgen05 address");
-        self.line(std.fmt.comptimePrint("tcgen05{s}.shared::cluster.b64 {s}, {s};", .{ op.suffix(), fmtAddr(addr_op), fmtOp(size) }));
+
+    pub fn tcgen05(comptime self: *KernelBuilder, comptime op: Tcgen05Op) Tcgen05Builder {
+        return .{ .kb = self, .op = op };
     }
-    pub fn mma(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
-        self.validateForm(.{ .op = .mma, .ty = d_ty });
-        const dst = self.tmp(d_ty);
-        self.line(std.fmt.comptimePrint("mma.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
+
+    pub fn mma(comptime self: *KernelBuilder) MmaBuilder {
+        return .{ .kb = self, .instruction = .mma };
     }
-    pub fn wgmma_mma_async(comptime self: *KernelBuilder, comptime shape: MmaShape, comptime layout: MmaLayout, comptime d_ty: PtxType, comptime a_ty: PtxType, comptime b_ty: PtxType, comptime c_ty: PtxType, a: anytype, b: anytype, c: anytype) Reg(d_ty) {
-        self.validateForm(.{ .op = .wgmma_mma_async, .ty = d_ty });
-        const dst = self.tmp(d_ty);
-        self.line(std.fmt.comptimePrint("wgmma.mma_async.sync.aligned{s}{s}{s}{s}{s}{s} {s}, {s}, {s}, {s};", .{ shape.suffix(), layout.suffix(), d_ty.suffix(), a_ty.suffix(), b_ty.suffix(), c_ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b), fmtOp(c) }));
-        return dst;
+    pub fn wgmma(comptime self: *KernelBuilder) MmaBuilder {
+        return .{ .kb = self, .instruction = .wgmma_mma_async };
     }
-    pub fn pmevent(comptime self: *KernelBuilder, a: anytype) void {
-        validate(.pmevent, PtxType.u32);
-        self.line(std.fmt.comptimePrint("pmevent {s};", .{fmtOp(a)}));
+
+    pub fn fence(comptime self: *KernelBuilder) FenceBuilder {
+        return .{ .kb = self };
     }
-    pub fn ldu(comptime self: *KernelBuilder, comptime ty: PtxType, addr_op: anytype) Reg(ty) {
-        self.validateForm(.{ .op = .ldu, .space = .global, .ty = ty });
-        validateMemoryAddressOperand(addr_op, .global, ty, "ldu address");
-        const dst = self.tmp(ty);
-        self.line(std.fmt.comptimePrint("ldu.global{s} {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtAddr(addr_op) }));
-        return dst;
+    pub fn prefetch(comptime self: *KernelBuilder) PrefetchBuilder {
+        return .{ .kb = self };
     }
-    pub fn prefetch(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
-        self.validateForm(.{ .op = .prefetch, .space = .global, .ty = PtxType.b8 });
-        validateOperandStateSpace(addr_op, .global, "prefetch address");
-        self.line(std.fmt.comptimePrint("prefetch.global{s} {s};", .{ level.suffix(), fmtAddr(addr_op) }));
-    }
-    pub fn prefetchu(comptime self: *KernelBuilder, comptime level: CacheLevel, addr_op: anytype) void {
-        self.validateForm(.{ .op = .prefetchu, .space = .global, .ty = PtxType.b8 });
-        validateOperandStateSpace(addr_op, .global, "prefetchu address");
-        self.line(std.fmt.comptimePrint("prefetchu{s} {s};", .{ level.suffix(), fmtAddr(addr_op) }));
-    }
+
     pub fn isspacep(comptime self: *KernelBuilder, comptime space: StateSpace, a: anytype) Reg(PtxType.pred) {
         self.validateForm(.{ .op = .isspacep, .space = space, .ty = PtxType.pred });
         const dst = self.tmp(PtxType.pred);
         self.line(std.fmt.comptimePrint("isspacep{s} {s}, {s};", .{ space.suffix(), fmtOp(dst), fmtOp(a) }));
         return dst;
     }
+
     pub fn cvt_pack(comptime self: *KernelBuilder, comptime ty: PtxType, a: anytype, b: anytype) Reg(ty) {
         const dst = self.tmp(ty);
         self.line(std.fmt.comptimePrint("cvt.pack{s} {s}, {s}, {s};", .{ ty.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
         return dst;
     }
-    pub fn cp_async_bulk(comptime self: *KernelBuilder, dst: anytype, src: anytype, size: anytype, flag: anytype) void {
-        validateOperandStateSpace(dst, .shared, "cp.async.bulk destination");
-        validateOperandStateSpace(src, .global, "cp.async.bulk source");
-        validateOperandStateSpace(flag, .shared, "cp.async.bulk barrier flag");
-        self.validateForm(.{ .op = .cp_async_bulk, .space = .shared, .ty = PtxType.b8 });
-        self.line(std.fmt.comptimePrint("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::flag {s}, {s}, {s}, {s};", .{ fmtAddr(dst), fmtAddr(src), fmtOp(size), fmtAddr(flag) }));
-    }
-    pub fn mbarrier(comptime self: *KernelBuilder, comptime op: MbarrierOp, addr_op: anytype) void {
-        self.validateTarget(.mbarrier);
-        validateOperandStateSpace(addr_op, .shared, "mbarrier address");
-        self.line(std.fmt.comptimePrint("mbarrier{s}.shared.b64 {s};", .{ op.suffix(), fmtAddr(addr_op) }));
-    }
 
-    pub fn fabric_submit(comptime self: *KernelBuilder, comptime scope: Scope, a: anytype, b: anytype) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("fabric.submit{s} {s}, {s}, {s};", .{ scope.suffix(), fmtOp(dst), fmtOp(a), fmtOp(b) }));
-        return dst;
-    }
-    pub fn fabric_try_get(comptime self: *KernelBuilder, comptime scope: Scope, a: anytype) Reg(PtxType.b32) {
-        const dst = self.tmp(PtxType.b32);
-        self.line(std.fmt.comptimePrint("fabric.try_get{s} {s}, {s};", .{ scope.suffix(), fmtOp(dst), fmtOp(a) }));
-        return dst;
-    }
     pub fn generate(comptime self: *KernelBuilder) []const u8 {
         var res: []const u8 = "";
         switch (self.kind) {
@@ -3296,8 +4098,8 @@ test "typed pointer address formatting verification" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
         pub fn ptr_format(k: *ptx.KernelBuilder) void {
-            const addr = k.tmp(PtxType.b64);
-            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr, .offset = 4 };
+            const addr_reg = k.tmp(PtxType.b64);
+            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr_reg, .offset = 4 };
             const r0 = k.tmp(PtxType.b32);
             k.st(.global, PtxType.b32, ptr, r0);
             _ = k.ld(.global, PtxType.b32, ptr);
@@ -3314,8 +4116,8 @@ test "typed pointer negative offset formatting verification" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
         pub fn ptr_negative_offset(k: *ptx.KernelBuilder) void {
-            const addr = k.tmp(PtxType.b64);
-            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr, .offset = -4 };
+            const addr_reg = k.tmp(PtxType.b64);
+            const ptr = ptx.Ptr(.global, PtxType.b32){ .reg = addr_reg, .offset = -4 };
             _ = k.ld(.global, PtxType.b32, ptr);
             k.ret();
         }
@@ -3329,9 +4131,9 @@ test "typed pointer validation accepts same-width aliases" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
         pub fn emit(m: *ptx.Module) void {
-            const state = m.allocGlobal(PtxType.b32, "state_alias", 1, 4);
+            const state_alias = m.allocGlobal(PtxType.b32, "state_alias", 1, 4);
             const k = m.entry("same_width_alias", .{});
-            _ = k.ld(.global, PtxType.u32, state);
+            _ = k.ld(.global, PtxType.u32, state_alias);
             k.ret();
         }
     });
@@ -3345,14 +4147,14 @@ test "compile-fail validation rejects typed pointer state mismatch" {
         "typed_pointer_state_mismatch",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const addr = k.tmp(ptx.PtxType.b64);
-        \\                const ptr = ptx.Ptr(.local, ptx.PtxType.b32){ .reg = addr };
-        \\                _ = k.ld(.global, ptx.PtxType.b32, ptr);
+        \\                const addr_reg = k.tmp(.b64);
+        \\                const ptr = ptx.Ptr(.local, .b32){ .reg = addr_reg };
+        \\                _ = k.ld(.global, .b32, ptr);
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "ld address must be in global state space, got local",
     );
 }
@@ -3362,14 +4164,14 @@ test "compile-fail validation rejects typed pointer width mismatch" {
         "typed_pointer_width_mismatch",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const addr = k.tmp(ptx.PtxType.b64);
-        \\                const ptr = ptx.Ptr(.global, ptx.PtxType.b64){ .reg = addr };
-        \\                _ = k.ld(.global, ptx.PtxType.b32, ptr);
+        \\                const addr_reg = k.tmp(.b64);
+        \\                const ptr = ptx.Ptr(.global, .b64){ .reg = addr_reg };
+        \\                _ = k.ld(.global, .b32, ptr);
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "ld address element width mismatch: expected .b32, got .b64",
     );
 }
@@ -3386,7 +4188,7 @@ test "unified library verification" {
             const rA = k.ldParam(ps.A);
             const rB = k.ldParam(ps.B);
             const rC = k.add(PtxType.f32, rA, rB);
-            k.stGlobal(PtxType.b64, "C", rC);
+            k.stGlobal(PtxType.f32, "C", rC);
             k.ret();
         }
     });
@@ -3462,7 +4264,7 @@ test "target propagated into kernel builder verification" {
         pub fn async_copy(k: *ptx.KernelBuilder) void {
             const dst = k.allocShared(PtxType.b8, "dst", 16, 16);
             const src = k.tmp(PtxType.b64);
-            k.cp_async(dst, src, 16);
+            k.cp_async(.normal).call(.{ ptx.addr(dst), ptx.addr(src), 16 });
             k.ret();
         }
     });
@@ -3521,10 +4323,10 @@ test "instruction form validation allows atomic add forms" {
     const ptx = @This();
     const result = comptime ptx.build(.{}, struct {
         pub fn atom_add(k: *ptx.KernelBuilder) void {
-            const addr = k.tmp(PtxType.b64);
+            const addr_reg = k.tmp(PtxType.b64);
             const val = k.tmp(PtxType.u32);
-            _ = k.atom(.add, .global, PtxType.u32, addr, val);
-            k.red(.add, .global, PtxType.u32, addr, val);
+            _ = k.atom(.add).space(.global).ty(PtxType.u32).call(.{ addr_reg, val });
+            k.red(.add).space(.global).ty(PtxType.u32).call(.{ addr_reg, val });
             k.ret();
         }
     });
@@ -3540,7 +4342,7 @@ test "instruction form validation carries ptx version into kernels" {
             const scratch = k.allocShared(PtxType.b8, "bulk_dst", 16, 16);
             const src = k.tmp(PtxType.b64);
             const flag = k.tmp(PtxType.b64);
-            k.cp_async_bulk(scratch, src, 16, flag);
+            k.cp_async(.bulk).call(.{ ptx.addr(scratch), ptx.addr(src), 16, ptx.addr(flag) });
             k.ret();
         }
     });
@@ -3554,12 +4356,12 @@ test "compile-fail validation rejects invalid load state space" {
         "invalid_ld_space",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                _ = k.ld(.tex, ptx.PtxType.b32, "addr");
+        \\                _ = k.ld(.tex, .b32, "addr");
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Illegal PTX state space for ld: tex",
     );
 }
@@ -3575,7 +4377,7 @@ test "compile-fail validation rejects invalid memory vector size" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Illegal vector size for PTX opcode ld.v8.b32",
     );
 }
@@ -3585,14 +4387,14 @@ test "compile-fail validation rejects invalid cp.async copy size" {
         "invalid_cp_async_size",
         \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
-        \\                const src = k.tmp(ptx.PtxType.b64);
-        \\                k.cp_async(dst, src, 12);
+        \\                const dst = k.allocShared(.b8, "dst", 16, 16);
+        \\                const src_reg = k.tmp(.b64);
+        \\                k.cp_async(.normal).call(.{ ptx.addr(dst), ptx.addr(src_reg), 12 });
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Illegal copy size for cp_async: 12",
     );
 }
@@ -3602,15 +4404,15 @@ test "compile-fail validation rejects non-immediate cp.async copy size" {
         "non_immediate_cp_async_size",
         \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
-        \\                const src = k.tmp(ptx.PtxType.b64);
-        \\                const n = k.tmp(ptx.PtxType.u32);
-        \\                k.cp_async(dst, src, n);
+        \\                const dst = k.allocShared(.b8, "dst", 16, 16);
+        \\                const src_reg = k.tmp(.b64);
+        \\                const n = k.tmp(.u32);
+        \\                k.cp_async(.normal).call(.{ ptx.addr(dst), ptx.addr(src_reg), n });
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Copy size for cp_async must be a comptime u32 immediate",
     );
 }
@@ -3620,14 +4422,14 @@ test "compile-fail validation rejects cp.async typed source state space" {
         "invalid_cp_async_source_space",
         \\        _ = ptx.build(.{ .target = .sm_80 }, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
-        \\                const src = ptx.Ptr(.local, ptx.PtxType.b8){ .reg = k.tmp(ptx.PtxType.b64) };
-        \\                k.cp_async(dst, src, 16);
+        \\                const dst = k.allocShared(.b8, "dst", 16, 16);
+        \\                const src_ptr = ptx.Ptr(.local, .b8){ .reg = k.tmp(.b64) };
+        \\                k.cp_async(.normal).call(.{ ptx.addr(dst), src_ptr, 16 });
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "cp.async source must be in global state space, got local",
     );
 }
@@ -3637,14 +4439,14 @@ test "compile-fail validation rejects target gated cp.async" {
         "target_gated_cp_async",
         \\        _ = ptx.build(.{ .target = .sm_75 }, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const dst = k.allocShared(ptx.PtxType.b8, "dst", 16, 16);
-        \\                const src = k.tmp(ptx.PtxType.b64);
-        \\                k.cp_async(dst, src, 16);
+        \\                const dst = k.allocShared(.b8, "dst", 16, 16);
+        \\                const src_reg = k.tmp(.b64);
+        \\                k.cp_async(.normal).call(.{ ptx.addr(dst), ptx.addr(src_reg), 16 });
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "PTX opcode cp_async is not supported by target sm_75",
     );
 }
@@ -3654,14 +4456,14 @@ test "compile-fail validation rejects invalid red cas form" {
         "invalid_red_cas",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const addr = k.tmp(ptx.PtxType.b64);
-        \\                const val = k.tmp(ptx.PtxType.u32);
-        \\                k.red(.cas, .global, ptx.PtxType.u32, addr, val);
+        \\                const addr_reg = k.tmp(.b64);
+        \\                const val = k.tmp(.u32);
+        \\                k.red(.cas).space(.global).ty(.u32).call(.{ addr_reg, val });
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Illegal PTX atomic/reduction form: red.cas.u32",
     );
 }
@@ -3735,7 +4537,7 @@ test "compile-fail validation rejects invalid maxntid dimensions" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "maxntid dimensions must be greater than zero",
     );
 }
@@ -3750,7 +4552,7 @@ test "compile-fail validation rejects invalid reqntid dimensions" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "reqntid dimensions must be greater than zero",
     );
 }
@@ -3765,7 +4567,7 @@ test "compile-fail validation rejects invalid cta occupancy directive" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "minnctapersm must be greater than zero",
     );
 }
@@ -3835,7 +4637,7 @@ test "compile-fail validation rejects void call to returning function" {
         "void_call_to_returning_function",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn emit(m: *ptx.Module) void {
-        \\                const answer = m.funcRet("answer", ptx.PtxType.u32, .{});
+        \\                const answer = m.funcRet("answer", .u32, .{});
         \\                answer.retVal(1);
         \\                const k = m.entry("invalid", .{});
         \\                k.callVoid(answer, .{});
@@ -3843,7 +4645,7 @@ test "compile-fail validation rejects void call to returning function" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Function answer returns a value; use callRet",
     );
 }
@@ -3856,12 +4658,12 @@ test "compile-fail validation rejects return call to void function" {
         \\                const helper = m.func("helper", .{});
         \\                helper.ret();
         \\                const k = m.entry("invalid", .{});
-        \\                _ = k.callRet(ptx.PtxType.u32, helper, .{});
+        \\                _ = k.callRet(.u32, helper, .{});
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Function helper does not return a value",
     );
 }
@@ -3874,13 +4676,13 @@ test "compile-fail validation rejects function argument count mismatch" {
         \\                const sink = m.func("sink", .{ .x = .u32, .y = .u32 });
         \\                sink.ret();
         \\                const k = m.entry("invalid", .{});
-        \\                const x = k.tmp(ptx.PtxType.u32);
+        \\                const x = k.tmp(.u32);
         \\                k.callVoid(sink, .{x});
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Call to sink expects 2 arguments, got 1",
     );
 }
@@ -3890,15 +4692,15 @@ test "compile-fail validation rejects return width mismatch" {
         "function_return_width_mismatch",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn emit(m: *ptx.Module) void {
-        \\                const answer = m.funcRet("answer", ptx.PtxType.u64, .{});
+        \\                const answer = m.funcRet("answer", .u64, .{});
         \\                answer.retVal(1);
         \\                const k = m.entry("invalid", .{});
-        \\                _ = k.callRet(ptx.PtxType.u32, answer, .{});
+        \\                _ = k.callRet(.u32, answer, .{});
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Call return width mismatch for answer: expected .u32, got .u64",
     );
 }
@@ -4047,7 +4849,7 @@ test "compile-fail validation rejects missing named parameter" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "No parameter named y in has_x",
     );
 }
@@ -4063,7 +4865,7 @@ test "compile-fail validation rejects parameter index out of bounds" {
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Parameter index 1 out of bounds for one_param; parameter count is 1",
     );
 }
@@ -4093,13 +4895,13 @@ test "compile-fail validation rejects marshalled argument width mismatch" {
         \\                const sink = m.func("sink", .{ .x = .u64 });
         \\                sink.ret();
         \\                const k = m.entry("invalid", .{});
-        \\                const x = k.tmp(ptx.PtxType.u32);
+        \\                const x = k.tmp(.u32);
         \\                k.callVoidMarshalled(sink, .{x});
         \\                k.ret();
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Call argument 0 width mismatch for sink: expected .u64, got .u32",
     );
 }
@@ -4109,7 +4911,7 @@ test "compile-fail validation rejects marshalled void call to returning function
         "marshalled_void_call_to_returning_function",
         \\        _ = ptx.build(.{}, struct {
         \\            pub fn emit(m: *ptx.Module) void {
-        \\                const answer = m.funcRet("answer", ptx.PtxType.u32, .{});
+        \\                const answer = m.funcRet("answer", .u32, .{});
         \\                answer.retVal(1);
         \\                const k = m.entry("invalid", .{});
         \\                k.callVoidMarshalled(answer, .{});
@@ -4117,24 +4919,7 @@ test "compile-fail validation rejects marshalled void call to returning function
         \\            }
         \\        });
         \\
-        ,
+    ,
         "Function answer returns a value; use callRetMarshalled",
-    );
-}
-
-test "compile-fail validation rejects st.param width mismatch" {
-    try expectCompileFail(
-        "st_param_width_mismatch",
-        \\        _ = ptx.build(.{}, struct {
-        \\            pub fn invalid(k: *ptx.KernelBuilder) void {
-        \\                const slot = k.declParam(ptx.PtxType.u64, "slot0");
-        \\                const x = k.tmp(ptx.PtxType.u32);
-        \\                k.stParam(slot, x);
-        \\                k.ret();
-        \\            }
-        \\        });
-        \\
-        ,
-        "st.param value width mismatch: expected .u64, got .u32",
     );
 }
